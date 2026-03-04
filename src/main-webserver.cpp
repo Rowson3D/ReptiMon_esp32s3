@@ -19,6 +19,8 @@
 #include <freertos/semphr.h>
 // Camera support
 #include "esp_camera.h"
+// Hardware watchdog (TWDT)
+#include <esp_task_wdt.h>
 
 // WiFi Configuration - managed via Preferences and Web UI
 String selectedSSID = "";
@@ -28,9 +30,10 @@ Preferences appPrefs;    // stores app settings persistently
 
 // Access Point configuration (fallback / entry point mode)
 String ap_ssid_dyn = "";          // e.g., ReptiMon-ABC123
-const char* ap_password = "reptile123";
+String ap_password_dyn = "";      // unique per-device password derived from chip eFuse MAC
 bool useAccessPoint = false;       // whether AP is currently active
 bool captivePortalActive = false;  // whether DNS redirect is active
+unsigned long apShutdownAt = 0;    // millis() target to tear down AP after successful connect (0 = not scheduled)
 DNSServer dnsServer;               // captive portal DNS server
 const byte DNS_PORT = 53;
 
@@ -40,6 +43,7 @@ SHT85 sht30(0x44);
 // Web server on port 80
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
+AsyncWebSocket camWs("/ws/cam"); // dedicated binary camera stream
 
 // ESP32 XIAO S3 Built-in LEDs
 #define LED_BUILTIN_RED   21  // Red LED
@@ -49,7 +53,7 @@ AsyncWebSocket ws("/ws");
 #define SENSOR_UPDATE_INTERVAL_MS     50    // Ultra-fast 20Hz updates (50ms)
 #define DISPLAY_UPDATE_INTERVAL_MS    100   // 10Hz display updates (100ms)
 #define SERIAL_BAUD_RATE             921600 // Maximum reliable baud rate
-#define I2C_CLOCK_SPEED              400000 // Fast I2C (400kHz)
+#define I2C_CLOCK_SPEED              100000 // Standard I2C 100kHz (debug; SHT85 ok up to 1MHz)
 
 // FreeRTOS task handles and synchronization
 TaskHandle_t sensorTaskHandle = NULL;
@@ -73,8 +77,15 @@ struct AppSettings {
   float comfortMin = 60.0f;
   float comfortMax = 100.0f;
   float comfortIdeal = 85.0f;
-  int camFrameSize = 6;  // FRAMESIZE_QVGA by default
-  int camQuality = 12;   // JPEG quality (lower is higher quality)
+  int camFrameSize = 8;  // FRAMESIZE_VGA (640x480) — 30fps sweet spot for OV3660 over WiFi
+  int camQuality = 15;   // JPEG quality 15 = ~8-12 KB/frame; necessary headroom for 30fps
+  int camBrightness = 0;  // -2..2
+  int camContrast = 1;    // -2..2
+  int camSaturation = 1;  // -2..2
+  int camWbMode = 0;      // 0=auto,1=sunny,2=cloudy,3=office,4=home
+  int camSpecial = 0;     // 0=none..6=sepia
+  bool camHmirror = false;
+  bool camVflip = false;
 };
 AppSettings appSettings;
 String mdnsHostname = "momo";
@@ -168,6 +179,7 @@ static const char* kGithubAsset = GITHUB_ASSET_NAME; // override via -DGITHUB_AS
 static String otaLatestVersion = "";
 static String otaLatestUrl = "";
 static volatile bool otaInProgress = false;
+static SemaphoreHandle_t otaLock = NULL;  // prevents concurrent OTA task starts (F9)
 // OTA state for UI synchronization
 static volatile int otaPct = 0;              // 0..100
 static String otaPhase = "idle";            // idle|starting|fw|fw_done|fs|fs_done|rebooting|error
@@ -176,7 +188,6 @@ static String otaErrorMsg = "";
 static SemaphoreHandle_t otaStateMutex = NULL;
 
 static void setOtaState(const char* phase, int pct = -1) {
-  if (!otaStateMutex) otaStateMutex = xSemaphoreCreateMutex();
   if (otaStateMutex) xSemaphoreTake(otaStateMutex, portMAX_DELAY);
   otaPhase = phase ? String(phase) : otaPhase;
   if (pct >= 0) otaPct = pct;
@@ -184,7 +195,6 @@ static void setOtaState(const char* phase, int pct = -1) {
   if (otaStateMutex) xSemaphoreGive(otaStateMutex);
 }
 static void setOtaError(const String& msg) {
-  if (!otaStateMutex) otaStateMutex = xSemaphoreCreateMutex();
   if (otaStateMutex) xSemaphoreTake(otaStateMutex, portMAX_DELAY);
   otaPhase = "error"; otaErrorMsg = msg;
   if (otaStateMutex) xSemaphoreGive(otaStateMutex);
@@ -241,6 +251,8 @@ void saveAppSettings(const AppSettings &s);
 
 // WiFi control state
 volatile bool wifiConnectPending = false;
+volatile bool scanScheduled    = false;  // set by handler, executed in loop()
+volatile bool connectScheduled = false;  // set by handler, executed in loop()
 unsigned long wifiConnectStart = 0;
 String pendingSSID = "";
 String pendingPass = "";
@@ -271,7 +283,12 @@ static String normalizeVersion(const String& v) {
   int i = 0;
   while (i < (int)v.length() && isspace((int)v[i])) i++;
   if (i < (int)v.length() && (v[i] == 'v' || v[i] == 'V')) i++;
-  return v.substring(i);
+  String s = v.substring(i);
+  // Strip git-describe dirty-build suffix: "0.3.1-1-g7e04d7c" -> "0.3.1" (F4)
+  // Without this, dev builds compare as newer than any release and OTA never fires.
+  int dash = s.indexOf('-');
+  if (dash > 0) s = s.substring(0, dash);
+  return s;
 }
 static int semverCompare(const String& aIn, const String& bIn) {
   String a = normalizeVersion(aIn), b = normalizeVersion(bIn);
@@ -315,6 +332,17 @@ static String httpGet(const String& url) {
 }
 
 // New: supports prereleases and returns both firmware and filesystem URLs
+// Cache: GitHub check result is cached for 5 minutes to avoid hammering the API and
+// to prevent concurrent HTTPS calls that trigger the non-reentrant bootloader_mmap.
+struct GhCache {
+  String tag, fwUrl, fsUrl, relPage, published;
+  bool   valid  = false;
+  bool   ok     = false;
+  unsigned long expiresMs = 0;
+};
+static GhCache ghCache;
+static SemaphoreHandle_t ghMutex = NULL; // ensure only one HTTPS call at a time
+
 static bool getGithubLatest(String& outTag, String& outFwUrl, String& outFsUrl, String& outReleasePage, String& outPublished) {
   String base = String("https://api.github.com/repos/") + kGithubOwner + "/" + kGithubRepo + "/releases";
   auto parseRelease = [&](JsonVariant v)->bool{
@@ -359,7 +387,6 @@ static bool getGithubLatest(String& outTag, String& outFwUrl, String& outFsUrl, 
 }
 
 static bool applyOtaFromUrl(const String& url, String& outMsg) {
-  if (otaInProgress) { outMsg = "OTA in progress"; return false; }
   otaLogf("Firmware OTA: GET %s", url.c_str());
   setOtaState("fw", 0);
   WiFiClientSecure client;
@@ -401,7 +428,6 @@ static bool applyOtaFromUrl(const String& url, String& outMsg) {
 
 // Filesystem OTA (LittleFS image)
 static bool applyFsOtaFromUrl(const String& url, String& outMsg) {
-  if (otaInProgress) { outMsg = "OTA in progress"; return false; }
   otaLogf("FS OTA: GET %s", url.c_str());
   setOtaState("fs", 0);
   WiFiClientSecure client;
@@ -419,6 +445,8 @@ static bool applyFsOtaFromUrl(const String& url, String& outMsg) {
   if (code != HTTP_CODE_OK) { outMsg = String("HTTP ") + code; https.end(); otaLogf("FS OTA: HTTP %d", code); return false; }
   int len = https.getSize();
   size_t updateSize = (len > 0) ? (size_t)len : UPDATE_SIZE_UNKNOWN;
+  // Unmount LittleFS before writing the new image to avoid filesystem corruption (F3)
+  LittleFS.end();
   // Prefer U_FS if available (Arduino-ESP32 2.x); fallback to U_SPIFFS for older cores
   #ifdef U_FS
     const int FS_TARGET = U_FS;
@@ -519,13 +547,15 @@ bool initCamera() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
+  config.xclk_freq_hz = 20000000; // stable XCLK for OV3660 on this board
   config.pixel_format = PIXFORMAT_JPEG;
 
   // Frame size and quality from settings
-  config.frame_size = (framesize_t)appSettings.camFrameSize; // e.g., FRAMESIZE_QVGA
-  config.jpeg_quality = appSettings.camQuality;              // 10-63
-  // Use double buffer and grab latest for smoother real-time preview
+  config.frame_size = (framesize_t)appSettings.camFrameSize;
+  config.jpeg_quality = appSettings.camQuality;
+  // Double buffer: one frame being sent, one being captured.
+  // Let the driver pick the optimal memory location (PSRAM vs DRAM) to avoid
+  // DMA coherency artifacts that occur when fb_location is forced on ESP32-S3.
   config.fb_count = 2;
   config.grab_mode = CAMERA_GRAB_LATEST;
 
@@ -539,26 +569,32 @@ bool initCamera() {
   if (s) {
     s->set_framesize(s, (framesize_t)appSettings.camFrameSize);
     s->set_quality(s, appSettings.camQuality);
-    // Sensible defaults for OV2640 image quality
-    s->set_whitebal(s, 1);       // enable auto white balance
-    s->set_awb_gain(s, 1);       // AWB gain enable
-    s->set_wb_mode(s, 0);        // auto WB
-    s->set_gain_ctrl(s, 1);      // auto gain control
-    s->set_exposure_ctrl(s, 1);  // auto exposure control
-    s->set_aec2(s, 1);           // improved AEC algorithm
-    s->set_gainceiling(s, GAINCEILING_64X); // allow higher gain in low light
-    s->set_lenc(s, 1);           // lens correction to reduce color shading
-    s->set_bpc(s, 1);            // black pixel correction
-    s->set_wpc(s, 1);            // white pixel correction
-    s->set_dcw(s, 1);            // downsize quality improve
-    s->set_brightness(s, 1);     // -2..2 (slight lift)
-    s->set_contrast(s, 0);       // -2..2
-    s->set_saturation(s, 1);     // -2..2 (slight boost)
-    s->set_special_effect(s, 0); // none
-    s->set_colorbar(s, 0);       // disable test pattern
-    // Optional flips depending on mounting
-    // s->set_hmirror(s, 1);
-    // s->set_vflip(s, 1);
+    // OV3660-tuned defaults
+    // AWB & exposure
+    s->set_whitebal(s, 1);            // auto white balance on
+    s->set_awb_gain(s, 1);            // AWB gain on
+    s->set_wb_mode(s, appSettings.camWbMode); // persisted
+    s->set_gain_ctrl(s, 1);           // AGC on
+    s->set_exposure_ctrl(s, 1);       // AEC on
+    s->set_aec2(s, 1);                // AEC2 (improved exposure algorithm) — OV3660 supports this
+    s->set_ae_level(s, 0);            // AE compensation -2..2
+    s->set_gainceiling(s, GAINCEILING_4X); // OV3660 has good native SNR; keep gain low
+    //   for dark enclosures raise to GAINCEILING_8X or GAINCEILING_16X
+    // Image corrections (all supported on OV3660)
+    s->set_lenc(s, 1);                // lens shading correction
+    s->set_bpc(s, 1);                 // black pixel correction
+    s->set_wpc(s, 1);                 // white pixel correction
+    // NOTE: dcw (downscale crop) is OV2640-only; omitted here
+    // Colour & sharpness
+    s->set_brightness(s, appSettings.camBrightness);
+    s->set_contrast(s, appSettings.camContrast);
+    s->set_saturation(s, appSettings.camSaturation);
+    s->set_sharpness(s, 1);           // fixed — OV3660 hardware sharpening
+    s->set_denoise(s, 1);             // fixed — OV3660 noise reduction
+    s->set_special_effect(s, appSettings.camSpecial);
+    s->set_colorbar(s, 0);
+    s->set_hmirror(s, appSettings.camHmirror ? 1 : 0);
+    s->set_vflip(s, appSettings.camVflip ? 1 : 0);
   }
   cameraAvailable = true;
   Serial.println("Camera initialized successfully");
@@ -690,19 +726,11 @@ inline float calculateAbsoluteHumidity(float temp, float humidity) {
 }
 
 String getTemperatureStatus(float tempC) {
-  // Sensor temperature is in °C; thresholds may be saved in user units (°F or °C).
-  float tMinC = thresholds.tempMin;
-  float tMaxC = thresholds.tempMax;
-  float tIdealC = thresholds.tempIdeal;
-  if (appSettings.units == "F") {
-    auto f2c = [](float f){ return (f - 32.0f) * 5.0f / 9.0f; };
-    tMinC = f2c(thresholds.tempMin);
-    tMaxC = f2c(thresholds.tempMax);
-    tIdealC = f2c(thresholds.tempIdeal);
-  }
-  if (tempC < tMinC) return "Too Cold";
-  if (tempC > tMaxC) return "Too Hot";
-  // In range [min, max] is Perfect per request
+  // tempC is always in °C from the sensor.
+  // Thresholds are always stored in °C (frontend converts before saving).
+  if (thresholds.tempMin == 0.0f && thresholds.tempMax == 0.0f) return "Perfect"; // uninitialised
+  if (tempC < thresholds.tempMin) return "Too Cold";
+  if (tempC > thresholds.tempMax) return "Too Hot";
   return "Perfect";
 }
 
@@ -726,8 +754,15 @@ void loadAppSettings() {
   appSettings.comfortMin = appPrefs.getFloat("cmin", thresholds.comfortMin);
   appSettings.comfortMax = appPrefs.getFloat("cmax", thresholds.comfortMax);
   appSettings.comfortIdeal = appPrefs.getFloat("cideal", thresholds.comfortIdeal);
-  appSettings.camFrameSize = appPrefs.getInt("camsize", appSettings.camFrameSize);
-  appSettings.camQuality = appPrefs.getInt("camq", appSettings.camQuality);
+  appSettings.camFrameSize  = appPrefs.getInt("camsize", appSettings.camFrameSize);
+  appSettings.camQuality    = appPrefs.getInt("camq",    appSettings.camQuality);
+  appSettings.camBrightness = appPrefs.getInt("cambr",   appSettings.camBrightness);
+  appSettings.camContrast   = appPrefs.getInt("camco",   appSettings.camContrast);
+  appSettings.camSaturation = appPrefs.getInt("camsa",   appSettings.camSaturation);
+  appSettings.camWbMode     = appPrefs.getInt("camwb",   appSettings.camWbMode);
+  appSettings.camSpecial    = appPrefs.getInt("camfx",   appSettings.camSpecial);
+  appSettings.camHmirror    = appPrefs.getBool("camhm",  appSettings.camHmirror);
+  appSettings.camVflip      = appPrefs.getBool("camvf",  appSettings.camVflip);
   // Persisted installed firmware tag (if any)
   installedFwTag = appPrefs.getString("fw_tag", "");
   appPrefs.end();
@@ -759,7 +794,14 @@ void saveAppSettings(const AppSettings &s) {
   appPrefs.putFloat("cmax", s.comfortMax);
   appPrefs.putFloat("cideal", s.comfortIdeal);
   appPrefs.putInt("camsize", s.camFrameSize);
-  appPrefs.putInt("camq", s.camQuality);
+  appPrefs.putInt("camq",    s.camQuality);
+  appPrefs.putInt("cambr",   s.camBrightness);
+  appPrefs.putInt("camco",   s.camContrast);
+  appPrefs.putInt("camsa",   s.camSaturation);
+  appPrefs.putInt("camwb",   s.camWbMode);
+  appPrefs.putInt("camfx",   s.camSpecial);
+  appPrefs.putBool("camhm",  s.camHmirror);
+  appPrefs.putBool("camvf",  s.camVflip);
   if (installedFwTag.length()) appPrefs.putString("fw_tag", installedFwTag);
   appPrefs.end();
 }
@@ -806,13 +848,27 @@ void updateLEDStatusFast(float temp, float humidity) {
 
 void printUltraFastReading(EnvironmentData &data) {
   Serial.printf("Temp %.2f°C  RH %.1f%%  DewPt %.1f°C  HeatIdx %.1f°C  VPD %.2f kPa  AbsHum %.2f g/m³\n",
-                data.temperature, data.humidity, data.dewPoint, 
+                data.temperature, data.humidity, data.dewPoint,
                 data.heatIndex, data.vaporPressureDeficit, data.absoluteHumidity);
 }
 
+// Build AP SSID unique per device: ReptiMon-XXYYZZ (last 3 bytes of eFuse MAC)
+static String buildApSsid() {
+  uint64_t mac = ESP.getEfuseMac();
+  char buf[7]; sprintf(buf, "%06X", (uint32_t)(mac & 0xFFFFFF));
+  return String("ReptiMon-") + buf;
+}
+// Build AP password unique per device: 8 hex chars from eFuse MAC bytes 3-6
+static String buildApPassword() {
+  uint64_t mac = ESP.getEfuseMac();
+  char buf[9]; sprintf(buf, "%08X", (uint32_t)((mac >> 8) & 0xFFFFFFFF));
+  return String(buf);
+}
+
 void setupWiFi() {
-  // Load app settings to get hostname and thresholds before network init
-  loadAppSettings();
+  // NOTE: loadAppSettings() already called in setup(); ap_ssid_dyn / ap_password_dyn
+  // are initialized in setup() from chip eFuse MAC before this function is called.
+
   // Load stored credentials (if any)
   preferences.begin("wifi", true);
   String storedSSID = preferences.getString("ssid", "");
@@ -820,31 +876,25 @@ void setupWiFi() {
   preferences.end();
 
   if (storedSSID.length() == 0) {
-    // No stored credentials: start AP mode with captive portal
-    uint64_t chipid = ESP.getEfuseMac();
-    char idbuf[7];
-    sprintf(idbuf, "%06X", (uint32_t)(chipid & 0xFFFFFF));
-  ap_ssid_dyn = String("ReptiMon-") + idbuf;
+    // No stored credentials → start AP with captive portal immediately
     WiFi.mode(WIFI_AP);
     WiFi.softAPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
-    WiFi.softAP(ap_ssid_dyn.c_str(), ap_password, 6 /*channel*/, 0 /*hidden*/, 4 /*max conn*/);
+    WiFi.softAP(ap_ssid_dyn.c_str(), ap_password_dyn.c_str(), 6 /*channel*/, 0 /*hidden*/, 4 /*max conn*/);
     useAccessPoint = true;
     captivePortalActive = true;
     dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
-  Serial.println("\nAccess Point Mode Active");
+    Serial.println("\nAccess Point Mode Active");
     Serial.println("===================================================================");
-  Serial.print("Network: ");
-    Serial.println(ap_ssid_dyn);
-  Serial.print("Password: ");
-    Serial.println(ap_password);
-  Serial.print("IP address: ");
-    Serial.println(WiFi.softAPIP());
-  Serial.println("Connect your device to this network and open: " + WiFi.softAPIP().toString());
+    Serial.print("Network:    "); Serial.println(ap_ssid_dyn);
+    Serial.print("Password:   "); Serial.println(ap_password_dyn);
+    Serial.print("IP address: "); Serial.println(WiFi.softAPIP());
+    Serial.println("Connect to this network then open: http://" + WiFi.softAPIP().toString());
     Serial.println("===================================================================");
     return;
   }
-  
-  // Use stored credentials
+
+  // Use stored credentials – connect asynchronously (F10: no blocking 15-second loop)
+  // loop() monitors wifiConnectPending and handles success (mDNS) or timeout (AP fallback)
   selectedSSID = storedSSID;
   selectedPassword = storedPASS;
   WiFi.mode(WIFI_STA);
@@ -853,93 +903,43 @@ void setupWiFi() {
   } else {
     WiFi.begin(selectedSSID.c_str(), selectedPassword.c_str());
   }
-  
-  Serial.print("Connecting to '" + selectedSSID + "'");
-  
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-  
-  if (WiFi.status() == WL_CONNECTED) {
-  Serial.println("\nWiFi connected successfully.");
-    Serial.println("===================================================================");
-  Serial.print("Network: ");
-  Serial.println(selectedSSID);
-  Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
-  Serial.print("Signal strength: ");
-    Serial.print(WiFi.RSSI());
-    Serial.println(" dBm");
-  Serial.print("Gateway: ");
-    Serial.println(WiFi.gatewayIP());
-  Serial.print("Subnet: ");
-    Serial.println(WiFi.subnetMask());
-    Serial.println("===================================================================");
-  Serial.println("Web interface ready. Open your browser and go to: " + WiFi.localIP().toString());
-  Serial.println("Access from any device on your network.");
-    Serial.println("===================================================================");
-    // Stop AP/captive DNS if previously active
-    if (useAccessPoint) {
-      dnsServer.stop();
-      captivePortalActive = false;
-      WiFi.softAPdisconnect(true);
-      useAccessPoint = false;
-    }
-    // Start mDNS for easy discovery when connected to WiFi
-    mdnsActive = MDNS.begin(mdnsHostname.c_str());
-    if (mdnsActive) {
-      MDNS.addService("http", "tcp", 80);
-      Serial.printf("mDNS active: http://%s.local\n", mdnsHostname.c_str());
-    } else {
-      Serial.println("mDNS failed to start");
-    }
-  } else {
-  Serial.println("\nWiFi connection failed.");
-  Serial.println("Creating Access Point instead...");
-    uint64_t chipid = ESP.getEfuseMac();
-    char idbuf[7];
-    sprintf(idbuf, "%06X", (uint32_t)(chipid & 0xFFFFFF));
-  ap_ssid_dyn = String("ReptiMon-") + idbuf;
-    WiFi.mode(WIFI_AP);
-    WiFi.softAPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
-    WiFi.softAP(ap_ssid_dyn.c_str(), ap_password, 6 /*channel*/, 0 /*hidden*/, 4 /*max conn*/);
-    useAccessPoint = true;
-    captivePortalActive = true;
-    dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
-  Serial.println("AP IP address: " + WiFi.softAPIP().toString());
-  Serial.println("Connect to '" + ap_ssid_dyn + "' and open: " + WiFi.softAPIP().toString());
-  }
+  Serial.printf("Connecting to '%s' (non-blocking)...\n", selectedSSID.c_str());
+  wifiConnectPending = true;
+  wifiConnectStart   = millis();
 }
 
 String generateJsonData() {
-  DynamicJsonDocument doc(1024);
-  
+  DynamicJsonDocument doc(2048);
+
+  // Snapshot current sensor data safely under mutex to prevent cross-core data races (F2)
+  EnvironmentData snap;
+  if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
+  memcpy(&snap, (const void*)&currentData, sizeof(EnvironmentData));
+  if (dataMutex) xSemaphoreGive(dataMutex);
+
   // Current readings
-  float tempDisplay = currentData.temperature;
+  float tempDisplay = snap.temperature;
   if (appSettings.units == "F") {
-    tempDisplay = currentData.temperature * 9.0f / 5.0f + 32.0f;
+    tempDisplay = snap.temperature * 9.0f / 5.0f + 32.0f;
   }
   doc["temperature"] = tempDisplay;
-  doc["humidity"] = currentData.humidity;
-  float dewDisplay = currentData.dewPoint;
-  float heatIdxDisplay = currentData.heatIndex;
+  doc["humidity"] = snap.humidity;
+  float dewDisplay = snap.dewPoint;
+  float heatIdxDisplay = snap.heatIndex;
   if (appSettings.units == "F") {
-    dewDisplay = currentData.dewPoint * 9.0f / 5.0f + 32.0f;
-    heatIdxDisplay = currentData.heatIndex * 9.0f / 5.0f + 32.0f;
+    dewDisplay = snap.dewPoint * 9.0f / 5.0f + 32.0f;
+    heatIdxDisplay = snap.heatIndex * 9.0f / 5.0f + 32.0f;
   }
   doc["dewPoint"] = dewDisplay;
   doc["heatIndex"] = heatIdxDisplay;
-  doc["vpd"] = currentData.vaporPressureDeficit;
-  doc["absoluteHumidity"] = currentData.absoluteHumidity;
-  doc["timestamp"] = currentData.timestamp;
-  doc["valid"] = currentData.valid;
-  
+  doc["vpd"] = snap.vaporPressureDeficit;
+  doc["absoluteHumidity"] = snap.absoluteHumidity;
+  doc["timestamp"] = snap.timestamp;
+  doc["valid"] = snap.valid;
+
   // Status indicators
-  doc["tempStatus"] = getTemperatureStatus(currentData.temperature);
-  doc["humStatus"] = getHumidityStatus(currentData.humidity);
+  doc["tempStatus"] = getTemperatureStatus(snap.temperature);
+  doc["humStatus"] = getHumidityStatus(snap.humidity);
   doc["units"] = appSettings.units;
   
   // Thresholds
@@ -1075,9 +1075,11 @@ void setupWebServer() {
   }
   Serial.println("LittleFS initialized successfully");
   
-  // WebSocket handler
+  // WebSocket handlers
   ws.onEvent(onWsEvent);
   server.addHandler(&ws);
+  // Camera WebSocket — no event handler needed; camPushTask manages it
+  server.addHandler(&camWs);
   
   // Serve static files from data folder
   // Route: if captive portal is active, default to portal.html at root; otherwise index.html
@@ -1092,6 +1094,44 @@ void setupWebServer() {
   // Also expose explicit /portal and /index
   server.on("/portal", HTTP_GET, [](AsyncWebServerRequest *request){ request->send(LittleFS, "/portal.html", String(), false); });
   server.on("/index", HTTP_GET, [](AsyncWebServerRequest *request){ request->send(LittleFS, "/index.html", String(), false); });
+
+  // Setup-complete confirmation page — captive WebView navigates here after WiFi connect.
+  // A fresh 200 response to a non-portal URL signals iOS/Android that the portal is resolved,
+  // triggering the system "Done" button without any redirect to the main dashboard.
+  server.on("/done", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String staIp = WiFi.localIP().toString();
+    String html = R"rawliteral(
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,shrink-to-fit=no,viewport-fit=cover">
+<title>ReptiMon Connected</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{background:#080e09;color:#e2ebe0;font:15px/1.5 ui-sans-serif,system-ui,-apple-system,sans-serif;
+  min-height:100dvh;display:flex;align-items:center;justify-content:center;}
+.wrap{text-align:center;padding:40px 24px;max-width:340px;width:100%}
+.check{width:64px;height:64px;border-radius:50%;background:rgba(74,222,128,.12);
+  display:flex;align-items:center;justify-content:center;margin:0 auto 20px}
+.title{font-size:22px;font-weight:700;color:#4ade80;margin-bottom:8px}
+.sub{color:#728c6e;font-size:14px;margin-bottom:24px;line-height:1.6}
+.ip{display:inline-block;font-family:ui-monospace,monospace;font-size:15px;font-weight:600;
+  background:#131d14;border:1px solid #263a28;border-radius:10px;padding:9px 18px;color:#e2ebe0}
+.note{margin-top:20px;font-size:12px;color:#4a6047;line-height:1.6}
+</style></head><body>
+<div class="wrap">
+  <div class="check">
+    <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#4ade80" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+  </div>
+  <div class="title">Connected!</div>
+  <div class="sub">ReptiMon is live on your network.<br>Tap <strong style="color:#e2ebe0">Done</strong> to close this screen.</div>
+  <div class="ip">)rawliteral";
+    html += staIp;
+    html += R"rawliteral(</div>
+  <div class="note">You can reach the dashboard at the IP above<br>once you reconnect to your home network.</div>
+</div>
+</body></html>)rawliteral";
+    request->send(200, "text/html", html);
+  });
   // Static assets under root
   // IMPORTANT: Disable cache for core SPA assets to avoid client-side mismatches after updates
   server.serveStatic("/index.html", LittleFS, "/index.html").setCacheControl("no-cache, no-store, must-revalidate");
@@ -1099,9 +1139,10 @@ void setupWebServer() {
   server.serveStatic("/style.css", LittleFS, "/style.css").setCacheControl("no-cache, no-store, must-revalidate");
   server.serveStatic("/components", LittleFS, "/components/").setCacheControl("no-cache, no-store, must-revalidate");
   server.serveStatic("/partials", LittleFS, "/partials/").setCacheControl("no-cache, no-store, must-revalidate");
-  // Vendor and everything else can be cached for a while
+  // Vendor assets — long cache is fine
   server.serveStatic("/vendor", LittleFS, "/vendor/").setCacheControl("public, max-age=86400");
-  server.serveStatic("/", LittleFS, "/").setCacheControl("public, max-age=86400");
+  // NOTE: The root catch-all serveStatic("/") is registered LAST (below, just before server.begin())
+  // so that all /api/* routes take precedence over static file lookup.
 
   // API endpoint for JSON data
   server.on("/api/data", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -1117,6 +1158,8 @@ void setupWebServer() {
     doc["state"] = state;
     doc["ssid"] = (st == WL_CONNECTED) ? selectedSSID : "";
     doc["ip"] = ap ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
+    doc["ap_ip"]  = WiFi.softAPIP().toString();
+    doc["sta_ip"] = WiFi.localIP().toString();
     doc["rssi"] = (st == WL_CONNECTED) ? WiFi.RSSI() : 0;
     doc["hostname"] = mdnsHostname;
     doc["ap"] = ap;
@@ -1190,18 +1233,10 @@ void setupWebServer() {
 
   // WiFi scan start (non-blocking)
   server.on("/api/wifi/scan/start", HTTP_GET, [](AsyncWebServerRequest *request) {
-    // If AP is active, keep it and add STA; otherwise just STA
-    if (useAccessPoint) {
-      WiFi.mode(WIFI_AP_STA);
-    } else {
-      WiFi.mode(WIFI_STA);
-    }
-    WiFi.scanDelete();
-    int r = WiFi.scanNetworks(true /* async */, true /* show_hidden */);
-    DynamicJsonDocument doc(256);
-    doc["status"] = (r == -1) ? "started" : "failed";
-    String out; serializeJson(doc, out);
-    request->send(202, "application/json", out);
+    // Schedule the actual WiFi API calls for loop() so no WiFi stack calls
+    // block this async handler (avoids mode-switch timing issues causing WIFI_SCAN_FAILED).
+    scanScheduled = true;
+    request->send(202, "application/json", "{\"status\":\"started\"}");
   });
 
   // WiFi scan results
@@ -1236,23 +1271,12 @@ void setupWebServer() {
     String ssid = body["ssid"] | "";
     String pass = body["password"] | "";
     if (ssid.length() == 0) { request->send(400, "application/json", "{\"error\":\"missing_ssid\"}"); return; }
+    // Save credentials and schedule the actual WiFi work for loop() so this response
+    // is delivered BEFORE any WiFi stack manipulation (avoids blocking the response).
     pendingSSID = ssid;
     pendingPass = pass;
-    if (useAccessPoint) {
-      WiFi.mode(WIFI_AP_STA);
-    } else {
-      WiFi.mode(WIFI_STA);
-    }
-  // Reset previous connection state before connecting
-  WiFi.disconnect(true, true);
-  delay(50);
-  if (pass.length() == 0) WiFi.begin(ssid.c_str()); else WiFi.begin(ssid.c_str(), pass.c_str());
-    wifiConnectPending = true;
-    wifiConnectStart = millis();
-    DynamicJsonDocument resp(256);
-    resp["status"] = "connecting";
-    String out; serializeJson(resp, out);
-    request->send(202, "application/json", out);
+    connectScheduled = true;
+    request->send(202, "application/json", "{\"status\":\"connecting\"}");
   });
 
   // WiFi reconnect
@@ -1273,7 +1297,7 @@ void setupWebServer() {
     if (deserializeJson(body, data, len)) { request->send(400, "application/json", "{\"error\":\"invalid_json\"}"); return; }
     bool enable = body["enable"].as<bool>();
     int channel = body.containsKey("channel") ? body["channel"].as<int>() : 6;
-    String pass = body.containsKey("password") ? (const char*)body["password"] : ap_password;
+    String pass = body.containsKey("password") ? (const char*)body["password"] : ap_password_dyn;
     if (enable) {
       if (WiFi.getMode() == WIFI_STA) WiFi.mode(WIFI_AP_STA); else WiFi.mode(WIFI_AP);
       if (ap_ssid_dyn.length() == 0) {
@@ -1365,23 +1389,60 @@ void setupWebServer() {
     preferences.remove("pass");
     preferences.end();
     request->send(200, "application/json", "{\"status\":\"ok\"}");
-    // Give the response time to flush, then restart
-  Serial.println("Forget WiFi requested - restarting into AP mode...");
-    delay(200);
-    ESP.restart();
+    Serial.println("Forget WiFi requested - restarting into AP mode...");
+    // Deferred restart so the HTTP response can flush (B7.2)
+    xTaskCreate([](void*){ vTaskDelay(pdMS_TO_TICKS(300)); ESP.restart(); vTaskDelete(NULL); },
+                "reboot_t", 1024, nullptr, 1, nullptr);
   });
 
-  // Captive portal helpers: respond to common OS connectivity checks
-  auto sendPortal = [](AsyncWebServerRequest *request){
-    // Always direct OS captive checks to root; root decides portal vs index
-    request->send(200, "text/html", "<html><head><meta http-equiv='refresh' content='0; url=/'/></head><body>Redirecting...</body></html>");
+  // Captive portal helpers: respond to common OS connectivity checks.
+  // While captive portal is active  → redirect to the portal so the OS shows the login UI.
+  // After WiFi connects (captivePortalActive = false) → return the OS-standard "success"
+  //   response for each probe so the OS changes its button from "Cancel" to "Done" and
+  //   the user can cleanly dismiss the captive browser on their own terms.
+
+  // iOS / macOS probe — expects exact "<HTML>...<BODY>Success</BODY>" to clear captive state
+  server.on("/hotspot-detect.html", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (captivePortalActive) {
+      request->send(200, "text/html", "<html><head><meta http-equiv='refresh' content='0; url=/'/></head><body>Redirecting...</body></html>");
+    } else {
+      request->send(200, "text/html", "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>");
+    }
+  });
+
+  // Android probe — expects HTTP 204 to signal no captive portal
+  auto androidProbe = [](AsyncWebServerRequest *request){
+    if (captivePortalActive) {
+      request->send(200, "text/html", "<html><head><meta http-equiv='refresh' content='0; url=/'/></head><body>Redirecting...</body></html>");
+    } else {
+      request->send(204);
+    }
   };
-  server.on("/generate_204", HTTP_GET, sendPortal);   // Android
-  server.on("/gen_204", HTTP_GET, sendPortal);         // Android alt
-  server.on("/hotspot-detect.html", HTTP_GET, sendPortal); // iOS/macOS
-  server.on("/ncsi.txt", HTTP_GET, sendPortal);        // Windows
-  server.on("/connecttest.txt", HTTP_GET, sendPortal); // Windows alt
-  server.on("/check_network_status.txt", HTTP_GET, sendPortal);
+  server.on("/generate_204", HTTP_GET, androidProbe);
+  server.on("/gen_204",      HTTP_GET, androidProbe);
+
+  // Windows probes
+  server.on("/ncsi.txt", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (captivePortalActive) {
+      request->send(200, "text/html", "<html><head><meta http-equiv='refresh' content='0; url=/'/></head><body>Redirecting...</body></html>");
+    } else {
+      request->send(200, "text/plain", "Microsoft NCSI");
+    }
+  });
+  server.on("/connecttest.txt", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (captivePortalActive) {
+      request->send(200, "text/html", "<html><head><meta http-equiv='refresh' content='0; url=/'/></head><body>Redirecting...</body></html>");
+    } else {
+      request->send(200, "text/plain", "Microsoft Connect Test");
+    }
+  });
+  server.on("/check_network_status.txt", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (captivePortalActive) {
+      request->send(200, "text/html", "<html><head><meta http-equiv='refresh' content='0; url=/'/></head><body>Redirecting...</body></html>");
+    } else {
+      request->send(200, "text/plain", "success");
+    }
+  });
   
   // Handle 404: during captive portal, redirect everything to root (portal)
   server.onNotFound([](AsyncWebServerRequest *request) {
@@ -1391,10 +1452,6 @@ void setupWebServer() {
       request->send(404, "text/plain", "File not found");
     }
   });
-  
-  server.begin();
-  Serial.println("Web server started.");
-  Serial.println("Serving static files from LittleFS.");
 
   // Settings endpoints
   server.on("/api/settings/get", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -1412,9 +1469,16 @@ void setupWebServer() {
     th["comfortMax"] = appSettings.comfortMax;
     th["comfortIdeal"] = appSettings.comfortIdeal;
     JsonObject cam = doc.createNestedObject("camera");
-    cam["available"] = cameraAvailable;
-    cam["frameSize"] = appSettings.camFrameSize;
-    cam["quality"] = appSettings.camQuality;
+    cam["available"]   = cameraAvailable;
+    cam["frameSize"]   = appSettings.camFrameSize;
+    cam["quality"]     = appSettings.camQuality;
+    cam["brightness"]  = appSettings.camBrightness;
+    cam["contrast"]    = appSettings.camContrast;
+    cam["saturation"]  = appSettings.camSaturation;
+    cam["wbMode"]      = appSettings.camWbMode;
+    cam["special"]     = appSettings.camSpecial;
+    cam["hmirror"]     = appSettings.camHmirror;
+    cam["vflip"]       = appSettings.camVflip;
     String out; serializeJson(doc, out);
     request->send(200, "application/json", out);
   });
@@ -1440,9 +1504,30 @@ void setupWebServer() {
     }
     if (body.containsKey("camera")) {
       JsonObject cam = body["camera"].as<JsonObject>();
-      if (cam.containsKey("frameSize")) ns.camFrameSize = cam["frameSize"].as<int>();
-      if (cam.containsKey("quality")) ns.camQuality = cam["quality"].as<int>();
+      // Clamp frame size (0=QCIF .. 13=QSXGA) and JPEG quality (10=best .. 63=worst)
+      if (cam.containsKey("frameSize"))  ns.camFrameSize  = constrain(cam["frameSize"].as<int>(), 0, 13);
+      if (cam.containsKey("quality"))    ns.camQuality    = constrain(cam["quality"].as<int>(), 10, 63);
+      if (cam.containsKey("brightness")) ns.camBrightness = constrain(cam["brightness"].as<int>(), -2, 2);
+      if (cam.containsKey("contrast"))   ns.camContrast   = constrain(cam["contrast"].as<int>(), -2, 2);
+      if (cam.containsKey("saturation")) ns.camSaturation = constrain(cam["saturation"].as<int>(), -2, 2);
+      if (cam.containsKey("wbMode"))     ns.camWbMode     = constrain(cam["wbMode"].as<int>(), 0, 4);
+      if (cam.containsKey("special"))    ns.camSpecial    = constrain(cam["special"].as<int>(), 0, 6);
+      if (cam.containsKey("hmirror"))    ns.camHmirror    = cam["hmirror"].as<bool>();
+      if (cam.containsKey("vflip"))      ns.camVflip      = cam["vflip"].as<bool>();
     }
+    // Validate hostname: mDNS-safe characters only (alphanumeric + hyphen), 1-32 chars
+    if (ns.hostname.length() == 0 || ns.hostname.length() > 32) ns.hostname = "momo";
+    for (int ci = 0; ci < (int)ns.hostname.length(); ci++) {
+      char ch = ns.hostname[ci];
+      if (!isalnum((unsigned char)ch) && ch != '-') { ns.hostname = "momo"; break; }
+    }
+    // Clamp thresholds to physically plausible ranges to reject NaN / out-of-bounds values (F18)
+    auto clampT = [](float v){ return isnan(v) ? 22.0f : constrain(v, -10.0f, 80.0f); };
+    auto clampH = [](float v){ return isnan(v) ? 50.0f : constrain(v,   0.0f, 100.0f); };
+    ns.tempMin   = clampT(ns.tempMin);   ns.tempMax   = clampT(ns.tempMax);
+    ns.tempIdeal = clampT(ns.tempIdeal);
+    ns.humMin    = clampH(ns.humMin);    ns.humMax    = clampH(ns.humMax);
+    ns.humIdeal  = clampH(ns.humIdeal);
     // Persist and apply
     saveAppSettings(ns);
     appSettings = ns;
@@ -1451,8 +1536,15 @@ void setupWebServer() {
     if (cameraAvailable) {
       sensor_t *s = esp_camera_sensor_get();
       if (s) {
-        s->set_framesize(s, (framesize_t)appSettings.camFrameSize);
-        s->set_quality(s, appSettings.camQuality);
+        s->set_framesize(s,    (framesize_t)appSettings.camFrameSize);
+        s->set_quality(s,      appSettings.camQuality);
+        s->set_brightness(s,   appSettings.camBrightness);
+        s->set_contrast(s,     appSettings.camContrast);
+        s->set_saturation(s,   appSettings.camSaturation);
+        s->set_wb_mode(s,      appSettings.camWbMode);
+        s->set_special_effect(s, appSettings.camSpecial);
+        s->set_hmirror(s,      appSettings.camHmirror ? 1 : 0);
+        s->set_vflip(s,        appSettings.camVflip   ? 1 : 0);
       }
     }
     DynamicJsonDocument resp(256);
@@ -1465,8 +1557,9 @@ void setupWebServer() {
   server.on("/api/system/reboot", HTTP_POST, [](AsyncWebServerRequest *request){
     request->send(200, "application/json", "{\"status\":\"rebooting\"}");
     Serial.println("Reboot requested via API");
-    delay(200);
-    ESP.restart();
+    // Deferred restart so the HTTP response can flush before the device resets (B7.2)
+    xTaskCreate([](void*){ vTaskDelay(pdMS_TO_TICKS(300)); ESP.restart(); vTaskDelete(NULL); },
+                "reboot_t", 1024, nullptr, 1, nullptr);
   });
 
   // Camera endpoints
@@ -1481,7 +1574,10 @@ void setupWebServer() {
     if (!cameraAvailable) { request->send(503, "application/json", "{\"error\":\"camera_unavailable\"}"); return; }
     if (cameraMutex) xSemaphoreTake(cameraMutex, portMAX_DELAY);
     camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb) { request->send(500, "application/json", "{\"error\":\"capture_failed\"}"); return; }
+    if (!fb) {
+      if (cameraMutex) xSemaphoreGive(cameraMutex); // F1: release mutex before error return
+      request->send(500, "application/json", "{\"error\":\"capture_failed\"}"); return;
+    }
   // Use non-deprecated response API
   AsyncWebServerResponse *response = request->beginResponse(200, String("image/jpeg"), fb->buf, fb->len);
     response->addHeader("Cache-Control", "no-store");
@@ -1521,9 +1617,8 @@ void setupWebServer() {
     String out; serializeJson(doc, out); request->send(200, "application/json", out);
   });
 
-  // Camera controls: adjust common OV2640 parameters at runtime
+  // Camera controls: adjust common OV3660 parameters at runtime
   server.on("/api/camera/ctrl", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
-    if (!cameraAvailable) { request->send(503, "application/json", "{\"error\":\"camera_unavailable\"}"); return; }
     DynamicJsonDocument body(512);
     if (deserializeJson(body, data, len)) { request->send(400, "application/json", "{\"error\":\"invalid_json\"}"); return; }
     if (cameraMutex) xSemaphoreTake(cameraMutex, portMAX_DELAY);
@@ -1533,6 +1628,7 @@ void setupWebServer() {
       if (body.containsKey("wb_mode")) { s->set_wb_mode(s, body["wb_mode"].as<int>()); }
       if (body.containsKey("whitebal")) { s->set_whitebal(s, body["whitebal"].as<bool>()); }
       if (body.containsKey("awb_gain")) { s->set_awb_gain(s, body["awb_gain"].as<bool>()); }
+      if (body.containsKey("quality"))  { s->set_quality(s, constrain(body["quality"].as<int>(), 4, 63)); }
       if (body.containsKey("brightness")) { s->set_brightness(s, body["brightness"].as<int>()); }
       if (body.containsKey("contrast")) { s->set_contrast(s, body["contrast"].as<int>()); }
       if (body.containsKey("saturation")) { s->set_saturation(s, body["saturation"].as<int>()); }
@@ -1587,14 +1683,15 @@ void setupWebServer() {
     request->send(202, "application/json", "{\"status\":\"starting\"}");
     // Run OTA in a separate task to avoid blocking; start even for empty POST bodies
     xTaskCreate([](void*){
+      // Atomic OTA lock: non-blocking take; if already taken, another OTA is running (F9)
+      if (!otaLock || xSemaphoreTake(otaLock, 0) != pdTRUE) { otaLog("Firmware OTA: already in progress"); vTaskDelete(NULL); return; }
       if (!otaLogMutex) otaLogMutex = xSemaphoreCreateMutex();
       if (otaLogMutex) { xSemaphoreTake(otaLogMutex, portMAX_DELAY); otaLogStart=0; otaLogCount=0; xSemaphoreGive(otaLogMutex); }
-  otaLog("Firmware OTA: starting");
-  setOtaState("starting", 0);
-      if (otaInProgress) { otaLog("Firmware OTA: already in progress"); vTaskDelete(NULL); return; }
+      otaLog("Firmware OTA: starting");
+      setOtaState("starting", 0);
       String tag, fwUrl, fsUrl, relPage, publishedAt, msg;
       bool ok = getGithubLatest(tag, fwUrl, fsUrl, relPage, publishedAt);
-      if (!ok) { otaLog("Firmware OTA: failed to query GitHub"); vTaskDelete(NULL); return; }
+      if (!ok) { otaLog("Firmware OTA: failed to query GitHub"); xSemaphoreGive(otaLock); vTaskDelete(NULL); return; }
       if (semverCompare(fwVersion, tag) < 0 && fwUrl.length()) {
         if (applyOtaFromUrl(fwUrl, msg)) {
           // Persist effective installed version (normalize to drop leading 'v')
@@ -1602,7 +1699,7 @@ void setupWebServer() {
           appPrefs.begin("app", false); appPrefs.putString("fw_tag", installedFwTag); appPrefs.end();
           otaLog("Firmware OTA: rebooting");
           setOtaState("rebooting", 100);
-          delay(250);
+          vTaskDelay(pdMS_TO_TICKS(300));
           ESP.restart();
         } else {
           otaLog(String("Firmware OTA: ") + msg);
@@ -1610,6 +1707,7 @@ void setupWebServer() {
       } else {
         otaLog("Firmware OTA: already up to date");
       }
+      xSemaphoreGive(otaLock);
       vTaskDelete(NULL);
     }, "ota_task", 8192, nullptr, 1, nullptr);
   });
@@ -1618,19 +1716,19 @@ void setupWebServer() {
   server.on("/api/ota/updatefs", HTTP_POST, [](AsyncWebServerRequest *request){
     request->send(202, "application/json", "{\"status\":\"starting\"}");
     xTaskCreate([](void*){
+      if (!otaLock || xSemaphoreTake(otaLock, 0) != pdTRUE) { otaLog("FS OTA: already in progress"); vTaskDelete(NULL); return; }
       if (!otaLogMutex) otaLogMutex = xSemaphoreCreateMutex();
       if (otaLogMutex) { xSemaphoreTake(otaLogMutex, portMAX_DELAY); otaLogStart=0; otaLogCount=0; xSemaphoreGive(otaLogMutex); }
-  otaLog("FS OTA: starting");
-  setOtaState("starting", 0);
-      if (otaInProgress) { otaLog("FS OTA: already in progress"); vTaskDelete(NULL); return; }
+      otaLog("FS OTA: starting");
+      setOtaState("starting", 0);
       String tag, fwUrl, fsUrl, relPage, publishedAt, msg;
       bool ok = getGithubLatest(tag, fwUrl, fsUrl, relPage, publishedAt);
-      if (!ok) { otaLog("FS OTA: failed to query GitHub"); vTaskDelete(NULL); return; }
+      if (!ok) { otaLog("FS OTA: failed to query GitHub"); xSemaphoreGive(otaLock); vTaskDelete(NULL); return; }
       if (fsUrl.length()) {
         if (applyFsOtaFromUrl(fsUrl, msg)) {
           otaLog("FS OTA: rebooting");
           setOtaState("rebooting", 100);
-          delay(250);
+          vTaskDelay(pdMS_TO_TICKS(300));
           ESP.restart();
         } else {
           otaLog(String("FS OTA: ") + msg);
@@ -1638,6 +1736,7 @@ void setupWebServer() {
       } else {
         otaLog("FS OTA: no filesystem asset in latest release");
       }
+      xSemaphoreGive(otaLock);
       vTaskDelete(NULL);
     }, "ota_fs_task", 8192, nullptr, 1, nullptr);
   });
@@ -1646,14 +1745,14 @@ void setupWebServer() {
   server.on("/api/ota/update_all", HTTP_POST, [](AsyncWebServerRequest *request){
     request->send(202, "application/json", "{\"status\":\"starting\"}");
     xTaskCreate([](void*){
+      if (!otaLock || xSemaphoreTake(otaLock, 0) != pdTRUE) { otaLog("UpdateAll: already in progress"); vTaskDelete(NULL); return; }
       if (!otaLogMutex) otaLogMutex = xSemaphoreCreateMutex();
       if (otaLogMutex) { xSemaphoreTake(otaLogMutex, portMAX_DELAY); otaLogStart=0; otaLogCount=0; xSemaphoreGive(otaLogMutex); }
-  otaLog("UpdateAll: starting");
-  setOtaState("starting", 0);
-      if (otaInProgress) { otaLog("UpdateAll: already in progress"); vTaskDelete(NULL); return; }
+      otaLog("UpdateAll: starting");
+      setOtaState("starting", 0);
       String tag, fwUrl, fsUrl, relPage, publishedAt, msg;
       bool ok = getGithubLatest(tag, fwUrl, fsUrl, relPage, publishedAt);
-      if (!ok) { otaLog("UpdateAll: failed to query GitHub"); vTaskDelete(NULL); return; }
+      if (!ok) { otaLog("UpdateAll: failed to query GitHub"); xSemaphoreGive(otaLock); vTaskDelete(NULL); return; }
       bool didSomething = false;
       // 1) Firmware update if newer
       if (semverCompare(fwVersion, tag) < 0 && fwUrl.length()) {
@@ -1683,11 +1782,12 @@ void setupWebServer() {
       if (didSomething) {
         otaLog("UpdateAll: rebooting");
         setOtaState("rebooting", 100);
-        delay(300);
+        vTaskDelay(pdMS_TO_TICKS(300));
         ESP.restart();
       } else {
         otaLog("UpdateAll: nothing to do");
       }
+      xSemaphoreGive(otaLock);
       vTaskDelete(NULL);
     }, "ota_all_task", 12288, nullptr, 1, nullptr);
   });
@@ -1773,14 +1873,30 @@ void setupWebServer() {
     }
     if (cameraMutex) xSemaphoreGive(cameraMutex);
   });
+
+  // Catch-all static handler — MUST be registered after ALL server.on() routes.
+  // ESPAsyncWebServer checks handlers in registration order; placing serveStatic("/")
+  // before any server.on() would cause those routes to be shadowed and LittleFS
+  // would be queried for every /api/* path, spamming vfs errors.
+  server.serveStatic("/", LittleFS, "/").setCacheControl("public, max-age=86400");
+
+  server.begin();
+  Serial.println("Web server started.");
+  Serial.println("Serving static files from LittleFS.");
 }
 
 // Web task for sending periodic updates
 void webTask(void *parameter) {
   const TickType_t xDelay = pdMS_TO_TICKS(1000); // 1 second updates
-  
+
   for(;;) {
-    if (WiFi.status() == WL_CONNECTED) {
+    // Broadcast in STA mode AND in AP / AP+STA mode so the dashboard stays live
+    // even before a WiFi network is joined (F5)
+    wifi_mode_t mode = WiFi.getMode();
+    bool netReady = (WiFi.status() == WL_CONNECTED)
+                 || (mode == WIFI_AP)
+                 || (mode == WIFI_AP_STA);
+    if (netReady) {
       // Send data to all connected WebSocket clients
       String jsonData = generateJsonData();
       if (jsonData != lastJsonData && ws.count() > 0) {
@@ -1789,7 +1905,7 @@ void webTask(void *parameter) {
         lastWebUpdate = millis();
       }
     }
-    
+
     vTaskDelay(xDelay);
   }
 }
@@ -1812,8 +1928,10 @@ void sensorTask(void *parameter) {
       newData.timestamp = millis();
       newData.valid = true;
       
-      // Lock-free atomic update
+      // Mutex-guarded write so readers on other cores see a consistent snapshot (F2)
+      if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
       memcpy((void*)&currentData, &newData, sizeof(EnvironmentData));
+      if (dataMutex) xSemaphoreGive(dataMutex);
       
       // Store in ring buffer for history
       readings[readingIndex] = newData;
@@ -1839,30 +1957,79 @@ void sensorTask(void *parameter) {
 void displayTask(void *parameter) {
   EnvironmentData data;
   const TickType_t xDelay = pdMS_TO_TICKS(DISPLAY_UPDATE_INTERVAL_MS);
-  
+
   for(;;) {
+    // xQueueReceive already blocks for up to xDelay; no second vTaskDelay needed (F11)
     if (xQueueReceive(sensorDataQueue, &data, xDelay) == pdTRUE) {
       if (data.valid) {
-        printUltraFastReading(data);
+        // printUltraFastReading(data); // suppressed — use 'pins' command to read on demand
         displayUpdateCount++;
         lastDisplayUpdate = millis();
       }
     }
-    
-    vTaskDelay(xDelay);
   }
 }
 
 // LED status task - Fast visual feedback
 void ledTask(void *parameter) {
   const TickType_t xDelay = pdMS_TO_TICKS(100); // 10Hz LED updates
-  
+
   for(;;) {
-    if (currentData.valid) {
-      updateLEDStatusFast(currentData.temperature, currentData.humidity);
+    // Snapshot under mutex to avoid torn reads across cores (F2)
+    bool   valid = false;
+    float  temp  = 0.0f;
+    float  hum   = 0.0f;
+    if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
+    valid = currentData.valid;
+    temp  = currentData.temperature;
+    hum   = currentData.humidity;
+    if (dataMutex) xSemaphoreGive(dataMutex);
+
+    if (valid) {
+      updateLEDStatusFast(temp, hum);
     }
-    
+
     vTaskDelay(xDelay);
+  }
+}
+
+// Camera WebSocket push task — grabs JPEG frames and sends them as binary WS messages.
+// Running on Core 0 at priority 2; uses vTaskDelayUntil to pace at ~30fps.
+// Clients receive raw JPEG bytes and render via URL.createObjectURL for zero-overhead display.
+void camPushTask(void *parameter) {
+  TickType_t lastWake = xTaskGetTickCount();
+  const TickType_t FRAME_TICKS = pdMS_TO_TICKS(33); // ~30 fps target
+
+  for (;;) {
+    vTaskDelayUntil(&lastWake, FRAME_TICKS);
+
+    // Nothing to do if no clients or camera unavailable
+    if (camWs.count() == 0 || !cameraAvailable) continue;
+
+    // Periodically clean up stale/disconnected clients
+    camWs.cleanupClients();
+
+    if (cameraMutex) xSemaphoreTake(cameraMutex, portMAX_DELAY);
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+      if (cameraMutex) xSemaphoreGive(cameraMutex);
+      continue;
+    }
+
+    // Validate JPEG integrity: must start with SOI (0xFF 0xD8) and end with EOI (0xFF 0xD9).
+    // A partial capture or DMA glitch produces frames without these markers — drop them.
+    bool validJpeg = (fb->len >= 4)
+                  && (fb->buf[0] == 0xFF) && (fb->buf[1] == 0xD8)
+                  && (fb->buf[fb->len-2] == 0xFF) && (fb->buf[fb->len-1] == 0xD9);
+
+    if (validJpeg) {
+      camWs.binaryAll(fb->buf, fb->len);
+      camStatFrames++;
+      camStatBytes += fb->len;
+    }
+
+    esp_camera_fb_return(fb);
+    if (cameraMutex) xSemaphoreGive(cameraMutex);
   }
 }
 
@@ -1879,56 +2046,122 @@ void setup() {
     installedFwTag = normalizeVersion(fwVersion);
     appPrefs.begin("app", false); appPrefs.putString("fw_tag", installedFwTag); appPrefs.end();
   }
-  
+
   // Initialize built-in LEDs
   pinMode(LED_BUILTIN_RED, OUTPUT);
   pinMode(LED_BUILTIN_BLUE, OUTPUT);
   digitalWrite(LED_BUILTIN_RED, LOW);
   digitalWrite(LED_BUILTIN_BLUE, LOW);
-  
-  // Initialize I2C with maximum speed for ultra-fast sensor readings
-  // XIAO ESP32S3: SDA=5, SCL=6
-  Wire.begin(5, 6);
-  Wire.setClock(I2C_CLOCK_SPEED);
-  
-  // Initialize SHT30 sensor
-  if (sht30.begin()) {
-  Serial.println("SHT30 sensor initialized successfully");
-  } else {
-  Serial.println("SHT30 sensor initialization failed!");
-    while(1) {
-      digitalWrite(LED_BUILTIN_RED, HIGH);
-      delay(500);
-      digitalWrite(LED_BUILTIN_RED, LOW);
-      delay(500);
+
+  // ── Create ALL synchronization primitives before any task or handler can run ──
+  // This must happen before setupWiFi() / setupWebServer() so ISR-context handlers
+  // and OTA lambdas always find valid semaphore handles. (B1.5 fix)
+  sensorDataQueue  = xQueueCreate(16, sizeof(EnvironmentData));
+  dataMutex        = xSemaphoreCreateMutex();
+  cameraMutex      = xSemaphoreCreateMutex();
+  otaStateMutex    = xSemaphoreCreateMutex();
+  otaLock          = xSemaphoreCreateMutex();
+
+  if (!sensorDataQueue || !dataMutex || !cameraMutex || !otaStateMutex || !otaLock) {
+    Serial.println("FATAL: Failed to create FreeRTOS objects!");
+    while (1);
+  }
+
+  // Build unique AP credentials from eFuse MAC (F6)
+  ap_ssid_dyn     = buildApSsid();
+  ap_password_dyn = buildApPassword();
+  Serial.printf("AP SSID: %s  Password: %s\n", ap_ssid_dyn.c_str(), ap_password_dyn.c_str());
+
+  // Initialize I2C — auto-detect pin orientation by scanning both combinations.
+  // User wiring: yellow=D5(GPIO6), white=D4(GPIO5).
+  // Try SDA=5,SCL=6 first; if no device found at 0x44, swap to SDA=6,SCL=5.
+  {
+    struct { uint8_t sda; uint8_t scl; const char* label; } configs[] = {
+      { 5, 6, "SDA=D4(GPIO5) SCL=D5(GPIO6)" },
+      { 6, 5, "SDA=D5(GPIO6) SCL=D4(GPIO5) [swapped]" },
+    };
+
+    bool busFound = false;
+    for (auto& cfg : configs) {
+      Wire.end();
+      delay(10);
+      Wire.begin(cfg.sda, cfg.scl);
+      Wire.setClock(I2C_CLOCK_SPEED);
+      delay(50); // settle
+
+      Serial.printf("I2C trying: %s\n", cfg.label);
+      Wire.beginTransmission(0x44);
+      if (Wire.endTransmission() == 0) {
+        Serial.printf("  SHT85 found at 0x44 with %s\n", cfg.label);
+        busFound = true;
+        break;
+      } else {
+        Serial.println("  0x44 not found on this orientation");
+      }
+    }
+
+    // Full bus scan after orientation is resolved
+    Serial.println("I2C full scan:");
+    bool anyFound = false;
+    for (uint8_t addr = 1; addr < 127; addr++) {
+      Wire.beginTransmission(addr);
+      if (Wire.endTransmission() == 0) {
+        Serial.printf("  Device at 0x%02X%s\n", addr, addr == 0x44 ? " <- SHT85" : "");
+        anyFound = true;
+      }
+    }
+    if (!anyFound) {
+      Serial.println("  No I2C devices found on either pin orientation.");
+      Serial.println("  -> Check sensor power (3.3V/GND) and add 4.7k pull-ups on SDA+SCL.");
     }
   }
-  
-  // Setup WiFi
-  // Improve WiFi stability for AP and STA
+
+  // Initialize SHT85 sensor — retry up to 5 times before giving up
+  {
+    bool sensorOk = false;
+    for (int attempt = 0; attempt < 5 && !sensorOk; attempt++) {
+      if (sht30.begin()) {
+        sensorOk = true;
+      } else {
+        Serial.printf("SHT85 init attempt %d/5 failed, retrying...\n", attempt + 1);
+        digitalWrite(LED_BUILTIN_RED, HIGH);
+        delay(500);
+        digitalWrite(LED_BUILTIN_RED, LOW);
+        delay(500);
+      }
+    }
+    if (sensorOk) {
+      Serial.println("SHT85 sensor initialized successfully");
+    } else {
+      Serial.println("SHT85 init failed after 5 attempts — continuing without sensor");
+      // Device still functions (AP + web) — sensor data will be marked invalid
+    }
+  }
+
+  // Setup WiFi (non-blocking)
   WiFi.persistent(false);
   WiFi.setSleep(false);
   setupWiFi();
 
-  // Initialize camera (best-effort)
+  // Initialize camera (best-effort; cameraMutex already created above)
   initCamera();
   camStatFrames = 0; camStatBytes = 0; camStatStartMs = millis();
-  // Create camera mutex
-  cameraMutex = xSemaphoreCreateMutex();
-  
+
   // Setup web server
   setupWebServer();
-  
-  // Create FreeRTOS synchronization objects
-  sensorDataQueue = xQueueCreate(16, sizeof(EnvironmentData));
-  dataMutex = xSemaphoreCreateMutex();
-  
-  if (sensorDataQueue == NULL || dataMutex == NULL) {
-  Serial.println("Failed to create FreeRTOS objects!");
-    while(1);
-  }
-  
+
   // Create high-priority tasks with optimized stack sizes
+  // Camera WebSocket push task — Core 0, priority 2, dedicated to streaming frames
+  xTaskCreatePinnedToCore(
+    camPushTask,
+    "CamPushTask",
+    4096,
+    NULL,
+    2,
+    NULL,
+    0
+  );
+
   xTaskCreatePinnedToCore(
     sensorTask,           // Task function
     "SensorTask",         // Task name
@@ -1938,7 +2171,7 @@ void setup() {
     &sensorTaskHandle,    // Task handle
     1                     // Core 1
   );
-  
+
   xTaskCreatePinnedToCore(
     displayTask,          // Task function
     "DisplayTask",        // Task name
@@ -1948,7 +2181,7 @@ void setup() {
     &displayTaskHandle,   // Task handle
     0                     // Core 0
   );
-  
+
   xTaskCreatePinnedToCore(
     ledTask,              // Task function
     "LEDTask",            // Task name
@@ -1958,7 +2191,7 @@ void setup() {
     &ledTaskHandle,       // Task handle
     0                     // Core 0
   );
-  
+
   xTaskCreatePinnedToCore(
     webTask,              // Task function
     "WebTask",            // Task name
@@ -1968,7 +2201,11 @@ void setup() {
     &webTaskHandle,       // Task handle
     0                     // Core 0
   );
-  
+
+  // Enable hardware watchdog — 30-second timeout resets the chip if loop() stalls (F8)
+  esp_task_wdt_init(30, true);
+  esp_task_wdt_add(NULL); // watch the Arduino loop() task
+
   Serial.printf("CPU Frequency: %d MHz\n", getCpuFrequencyMhz());
   Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
   Serial.printf("Target sensor rate: %.1f Hz\n", 1000.0f / SENSOR_UPDATE_INTERVAL_MS);
@@ -1981,10 +2218,14 @@ void setup() {
 }
 
 void loop() {
+  // Reset hardware watchdog at the top of every loop iteration (F8)
+  esp_task_wdt_reset();
+
   // Handle serial commands for system control
   if (Serial.available() > 0) {
     String command = Serial.readStringUntil('\n');
     command.trim();
+    String rawCommand = command;  // preserve original case for ssid/password extraction
     command.toLowerCase();
     
     if (command == "stats") {
@@ -2014,13 +2255,89 @@ void loop() {
   Serial.println("WiFi not connected");
       }
     }
+    else if (command == "ap") {
+      Serial.println("\nACCESS POINT CREDENTIALS:");
+      Serial.println("===================================================================");
+      Serial.printf("SSID:     %s\n", ap_ssid_dyn.c_str());
+      Serial.printf("Password: %s\n", ap_password_dyn.c_str());
+      Serial.printf("AP IP:    %s\n", WiFi.softAPIP().toString().c_str());
+      Serial.printf("AP active: %s\n", useAccessPoint ? "Yes" : "No");
+      Serial.println("===================================================================\n");
+    }
+    else if (command == "pins") {
+      Serial.println("\nI2C / SENSOR DIAGNOSTICS");
+      Serial.println("===================================================================");
+      Serial.printf("I2C config   : SDA=GPIO5 (D4, yellow)  SCL=GPIO6 (D5, white)\n");
+      Serial.printf("I2C clock    : %d Hz\n", I2C_CLOCK_SPEED);
+      Serial.printf("Sensor addr  : 0x44 (SHT85)\n");
+
+      // Live GPIO read
+      Serial.printf("D4 (SDA) raw : %d\n", digitalRead(5));
+      Serial.printf("D5 (SCL) raw : %d\n", digitalRead(6));
+
+      // Live I2C bus scan
+      Serial.println("I2C bus scan :");
+      bool anyFound = false;
+      for (uint8_t addr = 1; addr < 127; addr++) {
+        Wire.beginTransmission(addr);
+        if (Wire.endTransmission() == 0) {
+          Serial.printf("  0x%02X detected%s\n", addr, addr == 0x44 ? " <- SHT85 OK" : "");
+          anyFound = true;
+        }
+      }
+      if (!anyFound) Serial.println("  No devices found — check wiring and pull-up resistors");
+
+      // Current sensor state
+      Serial.println("Sensor data  :");
+      if (currentData.valid) {
+        Serial.printf("  Temperature : %.2f C\n", currentData.temperature);
+        Serial.printf("  Humidity    : %.2f %%\n", currentData.humidity);
+        Serial.printf("  Dew point   : %.2f C\n", currentData.dewPoint);
+        Serial.printf("  Heat index  : %.2f C\n", currentData.heatIndex);
+        Serial.printf("  VPD         : %.3f kPa\n", currentData.vaporPressureDeficit);
+        Serial.printf("  Abs. hum.   : %.2f g/m3\n", currentData.absoluteHumidity);
+        Serial.printf("  Read count  : %lu\n", sensorReadCount);
+        Serial.printf("  Last read   : %lu ms ago\n", millis() - lastSensorRead);
+      } else {
+        Serial.println("  No valid reading — sensor may not have initialised");
+      }
+      Serial.println("===================================================================\n");
+    }
+    else if (command.startsWith("ssid ")) {
+      // Format: ssid <network-name> <password>
+      // Password may be omitted for open networks.
+      String rest = rawCommand.substring(5); // strip "ssid "
+      rest.trim();
+      int spaceIdx = rest.indexOf(' ');
+      String newSsid, newPass;
+      if (spaceIdx < 0) {
+        // No password supplied
+        newSsid = rest;
+        newPass  = "";
+      } else {
+        newSsid = rest.substring(0, spaceIdx);
+        newPass  = rest.substring(spaceIdx + 1);
+        newPass.trim();
+      }
+      if (newSsid.length() == 0) {
+        Serial.println("Usage: ssid <network-name> <password>");
+      } else {
+        Serial.printf("[WiFi] Queuing connection to '%s'...\n", newSsid.c_str());
+        pendingSSID     = newSsid;
+        pendingPass     = newPass;
+        connectScheduled = true;
+      }
+    }
     else if (command == "help") {
-  Serial.println("\nAVAILABLE COMMANDS:");
-      Serial.println("stats  - Show performance statistics");
-      Serial.println("wifi   - Show WiFi information");
-      Serial.println("scan   - Scan for WiFi networks");
-      Serial.println("reset  - Restart the system");
-      Serial.println("help   - Show this help\n");
+      Serial.println("\nAVAILABLE COMMANDS:");
+      Serial.println("ap                    - Show AP SSID and password");
+      Serial.println("pins                  - I2C pin state, bus scan, live sensor reading");
+      Serial.println("ssid <name> <pass>    - Connect to a WiFi network (omit pass for open)");
+      Serial.println("stats                 - Show performance statistics");
+      Serial.println("wifi                  - Show WiFi information");
+      Serial.println("scan                  - Scan for WiFi networks");
+      Serial.println("reset                 - Restart the system");
+      Serial.println("help                  - Show this help\n");
     }
     else if (command == "scan") {
   Serial.println("Restarting to scan networks...");
@@ -2029,6 +2346,47 @@ void loop() {
     }
   }
   
+  // Handle deferred WiFi scan (avoids mode-switch timing issue in async handler)
+  if (scanScheduled) {
+    scanScheduled = false;
+    if (useAccessPoint) {
+      if (WiFi.getMode() != WIFI_AP_STA) {
+        WiFi.mode(WIFI_AP_STA);
+        vTaskDelay(pdMS_TO_TICKS(150));
+      }
+    } else if (WiFi.getMode() != WIFI_STA) {
+      WiFi.mode(WIFI_STA);
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    WiFi.scanDelete();
+    WiFi.scanNetworks(true /* async */, true /* show_hidden */);
+    Serial.println("[WiFi] Scan started from loop()");
+  }
+
+  // Handle deferred WiFi connect (avoids blocking response delivery in async handler)
+  if (connectScheduled) {
+    connectScheduled = false;
+    if (useAccessPoint) {
+      if (WiFi.getMode() != WIFI_AP_STA) {
+        WiFi.mode(WIFI_AP_STA);
+        vTaskDelay(pdMS_TO_TICKS(100));
+      }
+    } else {
+      WiFi.mode(WIFI_STA);
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    WiFi.disconnect(true, true);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    if (pendingPass.length() == 0) {
+      WiFi.begin(pendingSSID.c_str());
+    } else {
+      WiFi.begin(pendingSSID.c_str(), pendingPass.c_str());
+    }
+    wifiConnectPending = true;
+    wifiConnectStart = millis();
+    Serial.printf("[WiFi] Connecting to '%s' from loop()\n", pendingSSID.c_str());
+  }
+
   // Finalize non-blocking WiFi connect
   if (wifiConnectPending) {
     wl_status_t st = WiFi.status();
@@ -2045,18 +2403,19 @@ void loop() {
       {
         DynamicJsonDocument doc(256);
         doc["event"] = "wifi_connected";
-        doc["ip"] = WiFi.localIP().toString();
+        doc["ip"]    = WiFi.localIP().toString();
+        doc["ap_ip"] = WiFi.softAPIP().toString(); // AP IP so portal can navigate back to it
         String msg; serializeJson(doc, msg);
         ws.textAll(msg);
       }
-      // Small delay to allow message flush
-      delay(250);
-      // Stop AP/captive DNS now that we're connected
-      if (useAccessPoint) {
+      // Stop captive DNS redirect so the OS stops treating this as a captive portal,
+      // but KEEP the AP running so the captive browser stays connected and can
+      // receive the WebSocket event and display the Connected view.
+      // Schedule AP teardown after 90s — enough time for the user to open the dashboard.
+      if (captivePortalActive) {
         dnsServer.stop();
         captivePortalActive = false;
-        WiFi.softAPdisconnect(true);
-        useAccessPoint = false;
+        apShutdownAt = millis() + 12000UL; // shut AP down in 12s — after portal auto-redirects
       }
       // Start mDNS for LAN discovery
       mdnsActive = MDNS.begin(mdnsHostname.c_str());
@@ -2069,12 +2428,14 @@ void loop() {
       Serial.println("WiFi connected (non-blocking flow)");
   } else if (millis() - wifiConnectStart > 25000) { // timeout
       wifiConnectPending = false;
-      // Revert to AP
-      uint64_t chipid = ESP.getEfuseMac();
-      char idbuf[7];
-      sprintf(idbuf, "%06X", (uint32_t)(chipid & 0xFFFFFF));
-  ap_ssid_dyn = String("ReptiMon-") + idbuf;
-      WiFi.softAP(ap_ssid_dyn.c_str(), ap_password);
+      // Revert to AP — ap_ssid_dyn and ap_password_dyn were set in setup() (B3.2)
+      // Give the AP a dedicated gateway IP so captive-portal clients have a predictable target
+      WiFi.softAPConfig(
+        IPAddress(192, 168, 4, 1),   // AP IP / gateway
+        IPAddress(192, 168, 4, 1),   // gateway
+        IPAddress(255, 255, 255, 0)  // subnet
+      );
+      WiFi.softAP(ap_ssid_dyn.c_str(), ap_password_dyn.c_str());
       useAccessPoint = true;
       captivePortalActive = true;
       dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
@@ -2093,6 +2454,16 @@ void loop() {
     dnsServer.processNextRequest();
   }
 
+  // Tear down AP after setup-complete grace period
+  if (apShutdownAt > 0 && millis() >= apShutdownAt) {
+    apShutdownAt = 0;
+    if (useAccessPoint) {
+      WiFi.softAPdisconnect(true);
+      useAccessPoint = false;
+      Serial.println("Setup AP shut down after grace period.");
+    }
+  }
+
   // System health monitoring
   static unsigned long lastHealthCheck = 0;
   if (millis() - lastHealthCheck > 30000) { // Every 30 seconds
@@ -2108,16 +2479,18 @@ void loop() {
   Serial.printf("Low memory: %d bytes free\n", ESP.getFreeHeap());
     }
     
-    // WiFi check
-    if (WiFi.status() != WL_CONNECTED) {
-  Serial.println("WiFi disconnected, attempting reconnection...");
+    // WiFi check — only attempt reconnect when we're in STA mode (not in intentional AP mode)
+    wifi_mode_t wmode = WiFi.getMode();
+    bool staMode = (wmode == WIFI_STA) || (wmode == WIFI_AP_STA);
+    if (staMode && !wifiConnectPending && WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi disconnected, attempting reconnection...");
       WiFi.reconnect();
     }
   }
   
   // Clean WebSocket connections
   ws.cleanupClients();
-  
-  // Minimal delay to prevent watchdog issues
-  delay(100);
+
+  // Small yield to prevent the Arduino task from starving lower-priority IDLE hooks
+  delay(10);
 }

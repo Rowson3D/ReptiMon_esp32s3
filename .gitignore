@@ -3,3 +3,6 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Auto-generated version header — regenerated on every build from Git tags (F19)
+include/version_auto.h

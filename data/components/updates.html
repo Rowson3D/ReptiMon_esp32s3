@@ -1,0 +1,194 @@
+<!-- Updates component -->
+<div class="page-head">
+  <div>
+    <div class="page-kicker">OTA</div>
+    <div class="page-title">Updates</div>
+  </div>
+  <div class="actions">
+    <button class="btn sm" id="ota-check-btn" onclick="Ota.check()">Check for Updates</button>
+  </div>
+</div>
+
+<!-- Version card -->
+<div class="card mb-16">
+  <div class="card-head">Firmware Version</div>
+  <div class="card-body">
+    <div class="flex" style="gap:20px;flex-wrap:wrap;margin-bottom:16px;align-items:baseline">
+      <div>
+        <div class="muted small mb-8">Installed</div>
+        <div class="ota-current" id="ota-current">—</div>
+      </div>
+      <div id="ota-latest-wrap" style="display:none">
+        <div class="muted small mb-8">Latest</div>
+        <div class="flex" style="gap:8px;align-items:center">
+          <div class="ota-current" id="ota-latest">—</div>
+          <span class="ota-badge-new" id="ota-new-badge" style="display:none">NEW</span>
+        </div>
+      </div>
+    </div>
+
+    <div id="ota-meta" class="muted small mb-16" style="display:none">
+      Published: <span id="ota-published">—</span>
+      &nbsp;·&nbsp;
+      <a href="#" id="ota-release-link" target="_blank" rel="noopener">View release notes ↗</a>
+    </div>
+
+    <div class="actions" id="ota-action-row" style="display:none">
+      <button class="btn primary" id="ota-fw-btn" onclick="Ota.updateFirmware()">Update Firmware</button>
+      <button class="btn" id="ota-fs-btn" onclick="Ota.updateFilesystem()">Update Filesystem</button>
+      <button class="btn warn" id="ota-all-btn" onclick="Ota.updateAll()">Update Both</button>
+    </div>
+
+    <div id="ota-uptodate" class="muted small" style="display:none">Firmware is up to date.</div>
+    <div id="ota-offline-msg" class="muted small">Press "Check for Updates" to query GitHub releases.</div>
+  </div>
+</div>
+
+<!-- Progress -->
+<div class="card mb-16" id="ota-progress-card" style="display:none">
+  <div class="card-head">Update Progress</div>
+  <div class="card-body">
+    <div class="progress-label">
+      <span id="ota-phase-label">—</span>
+      <span id="ota-percent-label">0%</span>
+    </div>
+    <div class="progress">
+      <div class="progress-fill" id="ota-bar" style="width:0%"></div>
+    </div>
+    <div class="muted small mt-8" id="ota-state-detail">—</div>
+  </div>
+</div>
+
+<!-- Log -->
+<div class="card">
+  <div class="card-head">
+    OTA Log
+    <div class="ch-right">
+      <button class="btn sm ghost" onclick="Ota.clearLog()">Clear</button>
+    </div>
+  </div>
+  <div class="card-body p0">
+    <div class="console" id="ota-console" style="max-height:280px;border:none;border-radius:0">Ready.</div>
+  </div>
+</div>
+
+<script>
+(function () {
+  let pollTimer, logTimer;
+
+  async function check() {
+    const btn = document.getElementById('ota-check-btn');
+    if (btn) { btn.classList.add('loading'); btn.disabled = true; }
+    document.getElementById('ota-offline-msg').style.display = 'none';
+    try {
+      const d = await App.apiGet('/api/ota/check');
+      Object.assign(App.State.ota, d);
+      renderOtaState(d);
+      App.setText('footer-version', d.current ? `v${d.current}` : '—');
+      App.setText('brand-version',  d.current ? `v${d.current}` : '—');
+      // Update sidebar dot
+      const dot = document.getElementById('sb-ota-dot');
+      if (dot) dot.style.display = d.hasUpdate ? '' : 'none';
+    } catch {
+      App.showToast('Cannot reach GitHub — check your internet connection', 'danger');
+      document.getElementById('ota-offline-msg').style.display = '';
+    } finally {
+      if (btn) { btn.classList.remove('loading'); btn.disabled = false; }
+    }
+  }
+
+  function renderOtaState(d) {
+    App.setText('ota-current', d.current ? `v${d.current}` : '—');
+    App.setText('ota-latest',  d.latest  ? `v${d.latest}`  : '—');
+    document.getElementById('ota-latest-wrap').style.display = d.latest ? '' : 'none';
+    document.getElementById('ota-new-badge').style.display   = d.hasUpdate ? '' : 'none';
+    document.getElementById('ota-uptodate').style.display    = d.hasUpdate || !d.latest ? 'none' : '';
+    document.getElementById('ota-action-row').style.display  = d.hasUpdate ? '' : 'none';
+    document.getElementById('ota-meta').style.display        = d.latest ? '' : 'none';
+    const fsBtn = document.getElementById('ota-fs-btn');
+    if (fsBtn) fsBtn.style.display = d.hasFs ? '' : 'none';
+    const allBtn = document.getElementById('ota-all-btn');
+    if (allBtn) allBtn.style.display = d.hasFs ? '' : 'none';
+    if (d.publishedAt) {
+      App.setText('ota-published', new Date(d.publishedAt).toLocaleDateString());
+    }
+    const releaseLink = document.getElementById('ota-release-link');
+    if (releaseLink && d.releaseUrl) releaseLink.href = d.releaseUrl;
+  }
+
+  function startProgressPoll() {
+    document.getElementById('ota-progress-card').style.display = '';
+    clearInterval(pollTimer);
+    pollTimer = setInterval(async () => {
+      try {
+        const s = await App.apiGet('/api/ota/state');
+        const bar = document.getElementById('ota-bar');
+        const pct = document.getElementById('ota-percent-label');
+        const phase = document.getElementById('ota-phase-label');
+        const detail = document.getElementById('ota-state-detail');
+        if (bar)   bar.style.width = `${s.percent || 0}%`;
+        if (pct)   pct.textContent = `${s.percent || 0}%`;
+        if (phase) phase.textContent = s.phase || '—';
+        if (detail) detail.textContent = s.error || '';
+        if (!s.inProgress) {
+          clearInterval(pollTimer);
+          if (s.phase === 'error') {
+            App.showToast(`Update failed: ${s.error}`, 'danger', 8000);
+          } else if (s.phase === 'rebooting' || s.phase?.includes('done')) {
+            App.showToast('Update complete — device rebooting…', 'ok', 6000);
+          }
+        }
+      } catch {}
+    }, 1000);
+
+    // Also poll log
+    clearInterval(logTimer);
+    logTimer = setInterval(fetchLog, 1500);
+  }
+
+  async function fetchLog() {
+    try {
+      const text = await fetch('/api/ota/log').then(r => r.text());
+      const el = document.getElementById('ota-console');
+      if (el) { el.textContent = text; el.scrollTop = el.scrollHeight; }
+    } catch {}
+  }
+
+  async function triggerUpdate(endpoint) {
+    ['ota-fw-btn','ota-fs-btn','ota-all-btn'].forEach(id => {
+      const b = document.getElementById(id);
+      if (b) { b.disabled = true; b.classList.add('loading'); }
+    });
+    try {
+      await App.apiPost(endpoint);
+      startProgressPoll();
+    } catch {
+      App.showToast('Update request failed', 'danger');
+      ['ota-fw-btn','ota-fs-btn','ota-all-btn'].forEach(id => {
+        const b = document.getElementById(id);
+        if (b) { b.disabled = false; b.classList.remove('loading'); }
+      });
+    }
+  }
+
+  window.Ota = {
+    check,
+    updateFirmware()  { triggerUpdate('/api/ota/update');     },
+    updateFilesystem(){ triggerUpdate('/api/ota/updatefs');   },
+    updateAll()       { triggerUpdate('/api/ota/update_all'); },
+    clearLog() {
+      const el = document.getElementById('ota-console');
+      if (el) el.textContent = 'Log cleared.';
+    }
+  };
+
+  function refresh() {
+    // Render cached state if available
+    if (App.State.ota?.current) renderOtaState(App.State.ota);
+    else App.setText('ota-current', '—');
+  }
+
+  if (typeof Tabs !== 'undefined') Tabs.register('updates', refresh);
+  refresh();
+})();
+</script>

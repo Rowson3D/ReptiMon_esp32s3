@@ -1,58 +1,308 @@
-<section id="settings" class="panel active" aria-label="Settings">
-  <div class="grid-2">
-    <div class="panel-card">
-      <div class="panel-title">Units & Thresholds</div>
-      <form id="settingsForm" class="form">
-        <label>Hostname<input name="hostname" placeholder="momo" /></label>
-        <label>Units<select name="units"><option value="C">Celsius</option><option value="F">Fahrenheit</option></select></label>
-        <div class="thresholds-grid" role="group" aria-label="Thresholds">
-          <div class="hdr"></div>
-          <div class="hdr">Min</div>
-          <div class="hdr">Ideal</div>
-          <div class="hdr">Max</div>
+<!-- Settings component -->
+<div class="page-head">
+  <div>
+    <div class="page-kicker">Configuration</div>
+    <div class="page-title">Settings</div>
+  </div>
+</div>
 
-          <div class="row-label">Temperature</div>
-          <input type="number" step="0.1" name="tmin" aria-label="Temperature Min" />
-          <input type="number" step="0.1" name="tideal" aria-label="Temperature Ideal" />
-          <input type="number" step="0.1" name="tmax" aria-label="Temperature Max" />
-
-          <div class="row-label">Humidity</div>
-          <input type="number" step="0.1" name="hmin" aria-label="Humidity Min" />
-          <input type="number" step="0.1" name="hideal" aria-label="Humidity Ideal" />
-          <input type="number" step="0.1" name="hmax" aria-label="Humidity Max" />
-
-          <div class="row-label">Comfort</div>
-          <input type="number" step="1" min="0" max="100" name="cmin" aria-label="Comfort Min" />
-          <input type="number" step="1" min="0" max="100" name="cideal" aria-label="Comfort Ideal" />
-          <input type="number" step="1" min="0" max="100" name="cmax" aria-label="Comfort Max" />
+<!-- General -->
+<div class="card mb-16">
+  <div class="card-head">General</div>
+  <div class="card-body">
+    <div class="grid-2" style="gap:16px">
+      <div class="form-group" style="margin:0">
+        <label class="form-label">Temperature Units</label>
+        <div class="form-hint mb-8">Saves to device — all displayed values update immediately.</div>
+        <div class="actions">
+          <button class="btn" id="set-unit-c" onclick="Sett.setUnit('C')">°C Celsius</button>
+          <button class="btn" id="set-unit-f" onclick="Sett.setUnit('F')">°F Fahrenheit</button>
         </div>
-        <div class="split">
-          <label>Cam Size<select name="camsize">
-            <option value="5">CIF</option>
-            <option value="6" selected>QVGA</option>
-            <option value="7">VGA</option>
-            <option value="8">SVGA</option>
-            <option value="9">XGA</option>
-            <option value="10">SXGA (1280×1024)</option>
-            <option value="11">UXGA (1600×1200)</option>
-          </select></label>
-          <label>JPEG Quality<input type="number" min="10" max="63" name="camq" /></label>
+      </div>
+      <div class="form-group" style="margin:0">
+        <label class="form-label">Hostname</label>
+        <div class="input-row">
+          <input type="text" class="form-control" id="sett-hostname" placeholder="momo">
+          <button class="btn" onclick="Sett.saveHostname()">Set</button>
         </div>
-        <div class="toolbar right"><button class="btn primary" type="submit">Save</button></div>
-      </form>
-    </div>
-
-    <div class="panel-card">
-      <div class="panel-title">System Info</div>
-      <div class="stat-strip">
-        <div class="stat"><div class="k">Host</div><div id="qi-host" class="v">--</div></div>
-        <div class="stat"><div class="k">IP</div><div id="qi-ip" class="v">--</div></div>
-        <div class="stat"><div class="k">SSID</div><div id="qi-ssid" class="v">--</div></div>
-        <div class="stat"><div class="k">RSSI</div><div id="qi-rssi" class="v">--</div></div>
-        <div class="stat"><div class="k">Camera</div><div id="qi-camera" class="v">--</div></div>
-        <div class="stat"><div class="k">Units</div><div id="qi-units" class="v">--</div></div>
-        <div class="stat"><div class="k">Mode</div><div id="qi-mode" class="v">--</div></div>
+        <div class="form-hint">Device accessible at <span id="sett-hostname-preview">momo.local</span></div>
       </div>
     </div>
   </div>
-</section>
+</div>
+
+<!-- Thresholds -->
+<div class="card mb-16">
+  <div class="card-head">Thresholds</div>
+  <div class="card-body">
+    <div style="display:flex;flex-direction:column;gap:14px;margin-bottom:16px">
+      <div>
+        <div class="form-label mb-8">Temperature &deg;<span id="sett-temp-unit">C</span></div>
+        <div class="input-row">
+          <div class="form-group" style="flex:1;margin:0">
+            <label class="form-label">Low</label>
+            <input type="number" class="form-control" id="sett-temp-low" placeholder="e.g. 24">
+          </div>
+          <div class="form-group" style="flex:1;margin:0">
+            <label class="form-label">High</label>
+            <input type="number" class="form-control" id="sett-temp-high" placeholder="e.g. 32">
+          </div>
+        </div>
+      </div>
+      <div>
+        <div class="form-label mb-8">Humidity %</div>
+        <div class="input-row">
+          <div class="form-group" style="flex:1;margin:0">
+            <label class="form-label">Low</label>
+            <input type="number" class="form-control" id="sett-hum-low" placeholder="e.g. 50">
+          </div>
+          <div class="form-group" style="flex:1;margin:0">
+            <label class="form-label">High</label>
+            <input type="number" class="form-control" id="sett-hum-high" placeholder="e.g. 80">
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="actions right">
+      <button class="btn primary" id="sett-thresh-btn" onclick="Sett.saveThresholds()">Save Thresholds</button>
+    </div>
+  </div>
+</div>
+
+<!-- Animal Profiles -->
+<div class="card mb-16">
+  <div class="card-head">Animal Profiles</div>
+  <div id="sett-profiles-list"></div>
+  <div class="card-body" style="border-top:var(--border);display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+    <input id="sett-profile-name" class="form-control" placeholder="Profile name (e.g. Ball Python)…" style="flex:1;min-width:140px;">
+    <button class="btn sm primary" onclick="Sett.saveProfile()">Save current as profile</button>
+  </div>
+</div>
+
+<!-- Danger zone -->
+<div class="card" style="border-color:var(--danger);box-shadow:4px 4px 0 var(--danger)">
+  <div class="card-head" style="background:#FFF0F0;border-color:var(--danger)">Danger Zone</div>
+  <div class="card-body">
+    <div class="grid-2" style="gap:16px">
+      <div>
+        <div class="bold mb-8">Reboot Device</div>
+        <div class="muted small mb-8">Restarts the ESP32. Reconnect after a few seconds.</div>
+        <button class="btn danger sm" id="sett-reboot-btn" onclick="Sett.reboot()">Reboot Device</button>
+      </div>
+      <div>
+        <div class="bold mb-8">Factory Reset WiFi</div>
+        <div class="muted small mb-8">Clears saved credentials and reboots into AP mode for reconfiguration.</div>
+        <button class="btn danger sm" id="sett-forget-btn" onclick="Sett.forgetWifi()">Forget &amp; Reset</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  let _threshDirty = false;
+  const _threshIds = ['sett-temp-low','sett-temp-high','sett-hum-low','sett-hum-high'];
+  // Mark dirty as soon as the user types in any threshold field
+  _threshIds.forEach(id => {
+    document.getElementById(id)?.addEventListener('input', () => { _threshDirty = true; });
+  });
+
+  function refresh() {
+    // Unit buttons — reflect what the device is currently broadcasting
+    const u = App.State.units;
+    const uc = document.getElementById('set-unit-c');
+    const uf = document.getElementById('set-unit-f');
+    if (uc) uc.className = `btn${u === 'C' ? ' primary' : ''}`;
+    if (uf) uf.className = `btn${u === 'F' ? ' primary' : ''}`;
+
+    // Thresholds — read from data.thresholds (WebSocket) using canonical key names
+    const t = App.State.data.thresholds || {};
+    const inF = u === 'F';
+    const c2f = v => v != null ? +(v * 9/5 + 32).toFixed(1) : null;
+    const tuLabel = document.getElementById('sett-temp-unit');
+    if (tuLabel) tuLabel.textContent = inF ? 'F' : 'C';
+    // Don't overwrite fields the user is actively editing
+    if (!_threshDirty) {
+      const fields = {
+        'sett-temp-low':  inF ? c2f(t.tempMin) : t.tempMin,
+        'sett-temp-high': inF ? c2f(t.tempMax) : t.tempMax,
+        'sett-hum-low':   t.humMin,
+        'sett-hum-high':  t.humMax,
+      };
+      Object.entries(fields).forEach(([id, val]) => {
+        const el = document.getElementById(id);
+        if (el && val != null) el.value = val;
+      });
+    }
+
+    // Hostname
+    const hostname = App.State.wifi.hostname || App.State.data.system?.hostname || '';
+    const hn = document.getElementById('sett-hostname');
+    if (hn && !hn.value) hn.value = hostname;
+    updateHostnamePreview();
+    // Profiles list
+    if (window.Sett) Sett._renderProfiles();
+  }
+
+  function updateHostnamePreview() {
+    const val = document.getElementById('sett-hostname')?.value?.trim() || 'momo';
+    App.setText('sett-hostname-preview', `${val}.local`);
+  }
+  document.getElementById('sett-hostname')?.addEventListener('input', updateHostnamePreview);
+
+  window.Sett = {
+    refresh,
+    async setUnit(u) {
+      // Immediately save to firmware — device switches what °unit it broadcasts in WebSocket
+      const uc = document.getElementById('set-unit-c');
+      const uf = document.getElementById('set-unit-f');
+      if (uc) uc.className = `btn${u === 'C' ? ' primary' : ''}`;
+      if (uf) uf.className = `btn${u === 'F' ? ' primary' : ''}`;
+      try {
+        await App.apiPost('/api/settings/save', { units: u });
+        App.State.units = u;
+        App.showToast(`Units set to °${u} — values will update on next sensor tick`, 'ok');
+      } catch {
+        App.showToast('Failed to save unit preference', 'danger');
+      }
+    },
+    async saveHostname() {
+      const val = document.getElementById('sett-hostname')?.value?.trim();
+      if (!val) return;
+      try {
+        await App.apiPost('/api/wifi/hostname/set', { hostname: val });
+        App.showToast(`Hostname set to ${val}.local`, 'ok');
+      } catch { App.showToast('Failed to set hostname', 'danger'); }
+    },
+    async saveThresholds() {
+      const btn = document.getElementById('sett-thresh-btn');
+      if (btn) { btn.classList.add('loading'); btn.disabled = true; }
+      try {
+        const tl = parseFloat(document.getElementById('sett-temp-low')?.value);
+        const th = parseFloat(document.getElementById('sett-temp-high')?.value);
+        const hl = parseFloat(document.getElementById('sett-hum-low')?.value);
+        const hh = parseFloat(document.getElementById('sett-hum-high')?.value);
+        const inF = App.State.units === 'F';
+        const f2c = v => isNaN(v) ? null : +((v - 32) * 5/9).toFixed(2);
+        const thresholds = {
+          tempMin: inF ? f2c(tl) : (isNaN(tl) ? null : tl),
+          tempMax: inF ? f2c(th) : (isNaN(th) ? null : th),
+          humMin:  isNaN(hl) ? null : hl,
+          humMax:  isNaN(hh) ? null : hh,
+        };
+        await App.apiPost('/api/settings/save', { thresholds });
+        // Update live state immediately so dashboard charts react without waiting for next WS tick
+        if (!App.State.data.thresholds) App.State.data.thresholds = {};
+        Object.assign(App.State.data.thresholds, thresholds);
+        _threshDirty = false;
+        App.showToast('Thresholds saved', 'ok');
+      } catch {
+        App.showToast('Failed to save thresholds', 'danger');
+      } finally {
+        if (btn) { btn.classList.remove('loading'); btn.disabled = false; }
+      }
+    },
+    async reboot() {
+      if (!confirm('Reboot the device now?')) return;
+      const btn = document.getElementById('sett-reboot-btn');
+      if (btn) { btn.classList.add('loading'); btn.disabled = true; }
+      try {
+        await App.apiPost('/api/system/reboot');
+        App.showToast('Rebooting device…', 'warn', 8000);
+      } catch {
+        App.showToast('Reboot failed', 'danger');
+        if (btn) { btn.classList.remove('loading'); btn.disabled = false; }
+      }
+    },
+    async forgetWifi() {
+      if (!confirm('This will erase saved WiFi and reboot into AP setup mode. Continue?')) return;
+      const btn = document.getElementById('sett-forget-btn');
+      if (btn) { btn.classList.add('loading'); btn.disabled = true; }
+      try {
+        await App.apiPost('/api/wifi/forget');
+        App.showToast('WiFi credentials cleared — rebooting into AP mode…', 'warn', 8000);
+      } catch {
+        App.showToast('Failed', 'danger');
+        if (btn) { btn.classList.remove('loading'); btn.disabled = false; }
+      }
+    },
+
+    // ── Animal Profiles ──────────────────────────────────────────────────
+    _profilesKey: 'reptmon_profiles',
+    _getProfiles() { try { return JSON.parse(localStorage.getItem(this._profilesKey) || '{}'); } catch { return {}; } },
+    _saveProfiles(p) { localStorage.setItem(this._profilesKey, JSON.stringify(p)); },
+    _renderProfiles() {
+      const list = document.getElementById('sett-profiles-list');
+      if (!list) return;
+      const p = this._getProfiles();
+      const keys = Object.keys(p);
+      if (!keys.length) {
+        list.innerHTML = '<div style="padding:12px 16px;font-size:12px;color:var(--tx-3)">No profiles saved yet.</div>';
+        return;
+      }
+      const u = App.State.units;
+      list.innerHTML = keys.map(name => {
+        const pr = p[name];
+        const tlo = pr.tempMin != null ? (u === 'F' ? +(pr.tempMin*9/5+32).toFixed(1) : pr.tempMin) : '—';
+        const thi = pr.tempMax != null ? (u === 'F' ? +(pr.tempMax*9/5+32).toFixed(1) : pr.tempMax) : '—';
+        return `<div style="display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:var(--border);">
+          <div style="flex:1;min-width:0;">
+            <div style="font-size:13px;font-weight:600;">${name}</div>
+            <div style="font-size:11px;color:var(--tx-3)">
+              Temp ${tlo}–${thi}°${u} &nbsp;·&nbsp; Hum ${pr.humMin ?? '—'}–${pr.humMax ?? '—'}%
+            </div>
+          </div>
+          <button class="btn sm" onclick="Sett.loadProfile('${name.replace(/'/g,"\\'")}')">Load</button>
+          <button class="btn sm" onclick="Sett.deleteProfile('${name.replace(/'/g,"\\'")}')">Del</button>
+        </div>`;
+      }).join('');
+    },
+    saveProfile() {
+      const nameEl = document.getElementById('sett-profile-name');
+      const name = nameEl?.value?.trim();
+      if (!name) { App.showToast('Enter a profile name', 'warn'); return; }
+      const tl = parseFloat(document.getElementById('sett-temp-low')?.value);
+      const th = parseFloat(document.getElementById('sett-temp-high')?.value);
+      const hl = parseFloat(document.getElementById('sett-hum-low')?.value);
+      const hh = parseFloat(document.getElementById('sett-hum-high')?.value);
+      const inF = App.State.units === 'F';
+      const f2c = v => isNaN(v) ? null : +((v-32)*5/9).toFixed(2);
+      const p = this._getProfiles();
+      p[name] = {
+        tempMin: inF ? f2c(tl) : (isNaN(tl) ? null : tl),
+        tempMax: inF ? f2c(th) : (isNaN(th) ? null : th),
+        humMin:  isNaN(hl) ? null : hl,
+        humMax:  isNaN(hh) ? null : hh,
+      };
+      this._saveProfiles(p);
+      this._renderProfiles();
+      if (nameEl) nameEl.value = '';
+      App.showToast(`Profile "${name}" saved`, 'ok');
+    },
+    async loadProfile(name) {
+      const p = this._getProfiles();
+      if (!p[name]) return;
+      const thresholds = { ...p[name] };
+      try {
+        await App.apiPost('/api/settings/save', { thresholds });
+        if (!App.State.data.thresholds) App.State.data.thresholds = {};
+        Object.assign(App.State.data.thresholds, thresholds);
+        _threshDirty = false;
+        App.showToast(`Profile "${name}" loaded`, 'ok');
+        refresh();
+      } catch { App.showToast('Failed to apply profile', 'danger'); }
+    },
+    deleteProfile(name) {
+      if (!confirm(`Delete profile "${name}"?`)) return;
+      const p = this._getProfiles();
+      delete p[name];
+      this._saveProfiles(p);
+      this._renderProfiles();
+      App.showToast(`Profile "${name}" deleted`, 'ok');
+    },
+  };
+
+  if (typeof Tabs !== 'undefined') Tabs.register('settings', refresh);
+  refresh();
+})();
+</script>

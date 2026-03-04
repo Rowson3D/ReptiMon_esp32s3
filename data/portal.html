@@ -1,207 +1,355 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="theme-color" content="#0b0d10" />
-  <title>ReptiMon Setup</title>
-  <link rel="stylesheet" href="/style.css" />
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%23111827'/%3E%3Cpath d='M18 46V18h14c6.6 0 12 5.4 12 12s-5.4 12-12 12H18z' fill='%2360a5fa'/%3E%3Cpath d='M24 24h8a6 6 0 110 12h-8V24z' fill='%23e5e7eb'/%3E%3C/svg%3E" />
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ReptiMon — WiFi Setup</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    body {
+      padding: 0 !important;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--cream);
+      background-image: repeating-linear-gradient(
+        0deg, transparent, transparent 39px, rgba(0,0,0,0.04) 39px, rgba(0,0,0,0.04) 40px
+      ), repeating-linear-gradient(
+        90deg, transparent, transparent 39px, rgba(0,0,0,0.04) 39px, rgba(0,0,0,0.04) 40px
+      );
+    }
+
+    .portal-wrap {
+      width: min(92vw, 440px);
+      margin: 24px auto;
+    }
+
+    .portal-card {
+      background: var(--white);
+      border: var(--border);
+      border-radius: var(--r);
+      box-shadow: var(--shadow-lg);
+      overflow: hidden;
+    }
+
+    .portal-header {
+      background: var(--sb-bg);
+      padding: 28px 28px 24px;
+      border-bottom: var(--border);
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 12px;
+    }
+
+    .portal-brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .portal-mark {
+      width: 44px; height: 44px;
+      background: var(--accent);
+      border: var(--border);
+      border-radius: var(--r-sm);
+      display: flex; align-items: center; justify-content: center;
+      box-shadow: var(--shadow);
+    }
+
+    .portal-mark svg {
+      width: 24px; height: 24px;
+      stroke: #000; fill: none;
+      stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+    }
+
+    .portal-title {
+      font-size: 22px; font-weight: 900;
+      color: #F9FAFB;
+      letter-spacing: -.5px;
+    }
+
+    .portal-sub {
+      font-size: 13px;
+      color: var(--sb-tx);
+      font-weight: 500;
+    }
+
+    .portal-body {
+      padding: 24px 28px;
+    }
+
+    .portal-step {
+      font-size: 10px; font-weight: 700;
+      text-transform: uppercase; letter-spacing: .7px;
+      color: var(--accent-dk);
+      margin-bottom: 14px;
+    }
+
+    .scan-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+
+    .scan-label {
+      font-size: 12px; font-weight: 700;
+      text-transform: uppercase; letter-spacing: .5px;
+      color: var(--tx-2);
+    }
+
+    #portal-net-list {
+      min-height: 52px;
+      margin-bottom: 16px;
+    }
+
+    .portal-empty {
+      border: 2px dashed var(--cream-2);
+      border-radius: var(--r-sm);
+      padding: 20px;
+      text-align: center;
+      color: var(--tx-3);
+      font-size: 12px;
+    }
+
+    .portal-net-item {
+      display: flex; align-items: center; gap: 10px;
+      padding: 12px 14px;
+      border: var(--border);
+      border-radius: var(--r-sm);
+      background: var(--white);
+      cursor: pointer;
+      box-shadow: var(--shadow-sm);
+      margin-bottom: 6px;
+      transition: transform .08s, box-shadow .08s;
+    }
+    .portal-net-item:last-child { margin-bottom: 0; }
+    .portal-net-item:hover { transform: translate(-1px,-1px); box-shadow: 3px 3px 0 #000; }
+    .portal-net-item.selected { border-color: var(--accent-dk); background: var(--accent-bg); box-shadow: 2px 2px 0 var(--accent-dk); }
+    .portal-net-item .pni-name { flex: 1; font-size: 13px; font-weight: 700; }
+    .portal-net-item .pni-meta { font-size: 11px; color: var(--tx-3); display: flex; align-items: center; gap: 6px; }
+
+    .portal-status {
+      margin-top: 16px;
+      padding: 12px 16px;
+      border: var(--border);
+      border-radius: var(--r-sm);
+      font-size: 13px; font-weight: 600;
+      display: flex; align-items: center; gap: 10px;
+    }
+    .portal-status.connecting { background: var(--info-bg); border-color: #1E88C8; }
+    .portal-status.success    { background: var(--accent-bg); border-color: var(--accent-dk); color: #0A6640; }
+    .portal-status.failed     { background: var(--danger-bg); border-color: var(--danger); color: #8B1A1A; }
+  </style>
 </head>
 <body>
-  <header class="topbar">
-  <div class="brand">ReptiMon</div>
-    <div class="subtitle">Setup Portal</div>
-  </header>
-  <main class="container narrow">
-    <section class="panel active">
-      <div class="panel-card">
-        <div class="panel-title">Connect to WiFi</div>
-        <p class="muted">You're connected to the device access point. Choose your home network and enter the password. When connected, the device will switch to your network and be available at <code>http://momo.local</code>.</p>
-        <div class="toolbar">
-          <button id="scan" class="btn">Scan Networks</button>
-          <div id="spinner" class="muted" style="display:none">Scanning...</div>
+
+<div class="portal-wrap">
+  <div class="portal-card">
+    <!-- Header -->
+    <div class="portal-header">
+      <div class="portal-brand">
+        <div class="portal-mark">
+          <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>
         </div>
-        <div id="results" class="list"></div>
-        <div id="hiddenNotice" class="muted" style="display:none; margin-top:6px;">Hidden networks are omitted. Use the Manual form below to enter SSID and password.</div>
-      </div>
-      <div class="panel-card">
-        <div class="panel-title">Manual</div>
-        <form id="manual" class="form">
-          <label>SSID<input name="ssid" required placeholder="Your WiFi" /></label>
-          <label>Password<input name="password" type="password" placeholder="Password (blank if open)" /></label>
-          <div class="toolbar right"><button class="btn primary" type="submit">Connect</button></div>
-        </form>
-      </div>
-      <div id="connectOverlay" style="display:none;margin-top:12px" class="panel-card">
-        <div class="panel-title">Connecting...</div>
-        <p class="muted">Attempting to connect to <span id="coSsid"></span>. This page will update automatically.</p>
-        <div class="muted">Status: <span id="coStatus">starting</span></div>
-      </div>
-      <!-- Password Modal -->
-      <div id="pwModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); align-items:center; justify-content:center;">
-        <div class="panel-card" style="max-width:420px; width:92%;">
-          <div class="panel-title">Network Password</div>
-          <form id="pwForm" class="form">
-            <label>SSID<input id="pwSsid" name="ssid" required readonly /></label>
-            <label>Password<input id="pwPass" name="password" type="password" placeholder="Enter password" autofocus /></label>
-            <div class="toolbar right">
-              <button type="button" class="btn" id="pwCancel">Cancel</button>
-              <button type="submit" class="btn primary">Connect</button>
-            </div>
-          </form>
+        <div>
+          <div class="portal-title">ReptiMon</div>
+          <div class="portal-sub">WiFi Setup</div>
         </div>
       </div>
-    </section>
-  </main>
-  <footer class="footer">
-    <span id="footerStatus">Ready</span>
-    <span class="muted"> • </span>
-    <span class="muted">AP:</span> <span id="footerAP" class="muted">--</span>
-    <span class="muted"> • </span>
-    <span class="muted">IP:</span> <span id="footerIP" class="muted">--</span>
-  </footer>
-  <script>
-  const $ = (s)=>document.querySelector(s);
-  const setStatus = (t)=>($('#footerStatus').textContent=t);
-  const footerAP = $('#footerAP');
-  const footerIP = $('#footerIP');
-    const spinner = $('#spinner');
-    const overlay = $('#connectOverlay');
-    const coSsid = $('#coSsid');
-    const coStatus = $('#coStatus');
-    const hiddenNotice = $('#hiddenNotice');
-    const pwModal = $('#pwModal');
-    const pwForm = $('#pwForm');
-    const pwSsid = $('#pwSsid');
-    const pwPass = $('#pwPass');
-    let scanning = false; let pollTimer; let ws;
-    let lastNetworks = [];
+    </div>
 
-    function showSpinner(v){ if (spinner) spinner.style.display = v? 'inline-block':'none'; }
+    <!-- Body -->
+    <div class="portal-body">
+      <div class="portal-step">Step 1 — Select your network</div>
 
-    async function startScan(){
-      try { await fetch('/api/wifi/scan/start'); scanning = true; showSpinner(true); setStatus('Scanning...'); }
-      catch(e){ setStatus('Scan failed'); }
-    }
-    async function refreshList(){
-      try{
-        const r = await fetch('/api/wifi/scan/results');
-        const d = await r.json();
-        const el = $('#results');
-        if (!el) return;
-        scanning = (d.status === 'scanning');
-        showSpinner(scanning);
-        if (scanning){ setStatus('Scanning...'); return; }
-        if (Array.isArray(d.networks)){
-          // sort by RSSI desc and filter out hidden/empty SSIDs
-          lastNetworks = d.networks
-            .filter(n => (n.ssid && n.ssid.trim().length > 0))
-            .sort((a,b)=>b.rssi - a.rssi);
-          const rows = lastNetworks.map(n=>{
-            const secure = (n.security && n.security !== 'open');
-            const lock = secure ? '🔒' : '🔓';
-            return `<div class="row">
-              <div>${lock} ${n.ssid}</div>
-              <div class="muted">${n.rssi} dBm ${secure? 'secured':'open'}</div>
-              <button class="btn sm" data-ssid="${encodeURIComponent(n.ssid)}" data-secure="${secure}">Connect</button>
-            </div>`;
-          }).join('');
-          el.innerHTML = rows || '';
-          hiddenNotice.style.display = (rows === '') ? 'block' : 'none';
-          el.querySelectorAll('button').forEach(b=>b.addEventListener('click',()=>{
-            const ssid = decodeURIComponent(b.dataset.ssid);
-            const secure = b.dataset.secure === 'true';
-            if (secure) { openPwModal(ssid); } else { connectTo(ssid, ''); }
-          }));
-          setStatus(lastNetworks.length? 'Select a network':'No networks found');
+      <div class="scan-row">
+        <span class="scan-label">Available Networks</span>
+        <button class="btn sm" id="scan-btn" onclick="Portal.scan()">Scan</button>
+      </div>
+
+      <div id="portal-net-list">
+        <div class="portal-empty">Press Scan to discover nearby networks.</div>
+      </div>
+
+      <!-- Password form -->
+      <div id="portal-connect-form" style="display:none">
+        <div class="sep"></div>
+        <div class="portal-step" style="margin-top:16px">Step 2 — Enter password</div>
+
+        <div class="form-group">
+          <label class="form-label">Network</label>
+          <input type="text" class="form-control" id="portal-ssid" readonly>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Password</label>
+          <input type="password" class="form-control" id="portal-pass" placeholder="WiFi password" autocomplete="off">
+        </div>
+        <div class="actions">
+          <button class="btn primary" id="portal-join-btn" onclick="Portal.connect()" style="flex:1;justify-content:center">
+            Connect
+          </button>
+          <button class="btn ghost" onclick="Portal.cancel()">Cancel</button>
+        </div>
+      </div>
+
+      <!-- Status -->
+      <div id="portal-status" style="display:none" class="portal-status">
+        <span id="portal-status-icon"></span>
+        <span id="portal-status-msg"></span>
+      </div>
+    </div>
+  </div>
+
+  <div style="text-align:center;margin-top:16px;font-size:11px;color:var(--tx-3)">
+    ReptiMon · Connect once, access from anywhere on your network
+  </div>
+</div>
+
+<script>
+(function () {
+  const WS_URL = `ws://${location.host}/ws`;
+  let ws, scanPoll;
+
+  // WebSocket just for wifi events
+  function connectWs() {
+    ws = new WebSocket(WS_URL);
+    ws.onmessage = ({ data }) => {
+      try {
+        const msg = JSON.parse(data);
+        if (msg.event === 'wifi_connected') {
+          showStatus('success', `✓ Connected to ${msg.ssid || 'network'} — IP: ${msg.ip}`);
+          setTimeout(() => { location.href = '/'; }, 3000);
+        } else if (msg.event === 'wifi_failed') {
+          showStatus('failed', `✗ Connection failed: ${msg.reason || 'timeout'}. Try again.`);
+          const btn = document.getElementById('portal-join-btn');
+          if (btn) { btn.classList.remove('loading'); btn.disabled = false; }
         }
-      }catch(e){ /* ignore transient */ }
-    }
-    async function connectTo(ssid, pass=''){
-      coSsid.textContent = ssid; coStatus.textContent = 'connecting'; overlay.style.display='block';
-      try{ await fetch('/api/wifi/connect', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ssid, password: pass})}); }
-      catch(e){}
-      // start polling status during connect
-      pollStatus(true);
-    }
-    function openPwModal(ssid){
-      pwSsid.value = ssid; pwPass.value = '';
-      pwModal.style.display = 'flex';
-      setTimeout(()=>pwPass.focus(), 0);
-    }
-    function closePwModal(){ pwModal.style.display = 'none'; }
-    async function pollStatus(active){
-      if (!active){ clearInterval(pollTimer); return; }
-      clearInterval(pollTimer);
-      pollTimer = setInterval(async () => {
-        try{
-          const r = await fetch('/api/wifi/status');
-          const d = await r.json();
-          if (d.state === 'connected'){
-            coStatus.textContent = 'connected';
-            setStatus('Connected. Switch to your WiFi.');
-            clearInterval(pollTimer);
-          } else if (d.connecting){
-            coStatus.textContent = 'connecting';
-          } else if (d.state === 'disconnected'){
-            coStatus.textContent = 'disconnected';
-          }
-        }catch(e){}
-      }, 1000);
-    }
+      } catch {}
+    };
+    ws.onclose = () => setTimeout(connectWs, 2000);
+    ws.onerror = () => {};
+  }
 
-    function openWS(){
-      try{
-        ws = new WebSocket(`ws://${location.host}/ws`);
-        ws.onmessage = (e)=>{
-          try{
-            const msg = JSON.parse(e.data);
-            if (msg.event === 'wifi_connected'){
-              coStatus.textContent = 'connected';
-              setStatus('Connected. Switch to your WiFi.');
-            } else if (msg.event === 'wifi_failed'){
-              coStatus.textContent = 'failed';
-              setStatus('Connection failed, still in AP mode');
+  function showStatus(type, msg) {
+    const el = document.getElementById('portal-status');
+    const icon = document.getElementById('portal-status-icon');
+    const msgEl = document.getElementById('portal-status-msg');
+    if (!el) return;
+    el.className = `portal-status ${type}`;
+    el.style.display = 'flex';
+    if (icon) icon.textContent = type === 'connecting' ? '⟳' : type === 'success' ? '✓' : '✗';
+    if (msgEl) msgEl.textContent = msg;
+  }
+
+  function renderNetList(nets) {
+    const list = document.getElementById('portal-net-list');
+    if (!list) return;
+    if (!nets || nets.length === 0) {
+      list.innerHTML = '<div class="portal-empty">No networks found. Try scanning again.</div>';
+      return;
+    }
+    list.innerHTML = nets.map(n => `
+      <div class="portal-net-item" onclick="Portal._select(this,'${n.ssid.replace(/'/g,"\\'")}','${n.security||''}')">
+        <span class="pni-name">${n.ssid || '(hidden)'}</span>
+        <span class="pni-meta">
+          <span>${App_rssiDots(n.rssi)}</span>
+          <span>${n.rssi} dBm</span>
+          ${n.security && n.security !== 'open' ? '<span>🔒</span>' : ''}
+        </span>
+      </div>`).join('');
+  }
+
+  function App_rssiDots(rssi) {
+    const s = rssi == null ? 0 : rssi > -55 ? 4 : rssi > -67 ? 3 : rssi > -78 ? 2 : 1;
+    return [1,2,3,4].map(i => `<span style="display:inline-block;width:5px;height:5px;border-radius:50%;border:1px solid #000;margin-right:2px;background:${i<=s?'#2EC97D':'#F5F0E8'}"></span>`).join('');
+  }
+
+  window.Portal = {
+    async scan() {
+      const btn = document.getElementById('scan-btn');
+      const list = document.getElementById('portal-net-list');
+      if (btn) { btn.classList.add('loading'); btn.disabled = true; }
+      if (list) list.innerHTML = '<div class="portal-empty">Scanning…</div>';
+
+      try {
+        await fetch('/api/wifi/scan/start');
+        clearInterval(scanPoll);
+        let tries = 0;
+        scanPoll = setInterval(async () => {
+          tries++;
+          try {
+            const r = await fetch('/api/wifi/scan/results');
+            const nets = await r.json();
+            if (nets && nets.length > 0) {
+              clearInterval(scanPoll);
+              renderNetList(nets);
+              if (btn) { btn.classList.remove('loading'); btn.disabled = false; }
+            } else if (tries > 12) {
+              clearInterval(scanPoll);
+              renderNetList([]);
+              if (btn) { btn.classList.remove('loading'); btn.disabled = false; }
             }
-          }catch(err){}
-        };
-      }catch(e){}
-    }
+          } catch {}
+        }, 1000);
+      } catch {
+        if (list) list.innerHTML = '<div class="portal-empty">Scan failed. Is the device in range?</div>';
+        if (btn) { btn.classList.remove('loading'); btn.disabled = false; }
+      }
+    },
 
-    async function hydrateFooter(){
-      try{
-        const r = await fetch('/api/wifi/status');
-        const d = await r.json();
-        if (footerAP) footerAP.textContent = d.ap_ssid || 'AP Mode';
-        if (footerIP) footerIP.textContent = d.ip || '--';
-      }catch(e){}
-    }
+    _select(el, ssid, security) {
+      document.querySelectorAll('.portal-net-item').forEach(n => n.classList.remove('selected'));
+      el.classList.add('selected');
+      const ssidIn = document.getElementById('portal-ssid');
+      const passIn = document.getElementById('portal-pass');
+      const form   = document.getElementById('portal-connect-form');
+      if (ssidIn) ssidIn.value = ssid;
+      if (passIn) { passIn.value = ''; if (security && security !== 'open') passIn.focus(); }
+      if (form)  form.style.display = '';
+      const status = document.getElementById('portal-status');
+      if (status) status.style.display = 'none';
+    },
 
-    $('#scan').addEventListener('click', async ()=>{ await startScan(); setTimeout(refreshList, 1200); });
-    $('#manual').addEventListener('submit', async (e)=>{
-      e.preventDefault();
-      const f = e.target; const ssid=f.ssid.value.trim(); const password=f.password.value;
+    async connect() {
+      const ssid = document.getElementById('portal-ssid')?.value;
+      const pass = document.getElementById('portal-pass')?.value;
       if (!ssid) return;
-      connectTo(ssid, password);
-    });
-    pwForm.addEventListener('submit', (e)=>{
-      e.preventDefault();
-      const ssid = pwSsid.value.trim(); const pass = pwPass.value;
-      closePwModal();
-      connectTo(ssid, pass);
-    });
-    $('#pwCancel').addEventListener('click', ()=>{ closePwModal(); });
 
-    // Auto behavior: kick off a scan and periodically refresh networks list
-    (async function init(){
-      openWS();
-      hydrateFooter();
-      await startScan();
-      // refresh scan every 7s (start new scan if idle), refresh list every 1.2s
-      setInterval(async ()=>{ if (!scanning) await startScan(); }, 7000);
-      setInterval(refreshList, 1200);
-    })();
-  </script>
+      const btn = document.getElementById('portal-join-btn');
+      if (btn) { btn.classList.add('loading'); btn.disabled = true; }
+      showStatus('connecting', `Connecting to "${ssid}"…`);
+
+      try {
+        await fetch('/api/wifi/connect', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ssid, password: pass }),
+        });
+        // WS will fire wifi_connected or wifi_failed
+      } catch {
+        showStatus('failed', 'Connection request failed. Try again.');
+        if (btn) { btn.classList.remove('loading'); btn.disabled = false; }
+      }
+    },
+
+    cancel() {
+      document.getElementById('portal-connect-form').style.display = 'none';
+      document.getElementById('portal-status').style.display = 'none';
+      document.querySelectorAll('.portal-net-item').forEach(n => n.classList.remove('selected'));
+    }
+  };
+
+  // Boot
+  connectWs();
+  // Auto-scan on load
+  setTimeout(Portal.scan, 400);
+})();
+</script>
 </body>
 </html>

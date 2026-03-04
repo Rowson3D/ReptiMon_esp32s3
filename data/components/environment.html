@@ -1,0 +1,76 @@
+<!-- Environment component -->
+<div class="page-head">
+  <div>
+    <div class="page-kicker">Sensors</div>
+    <div class="page-title">Environment</div>
+  </div>
+</div>
+
+<!-- Rolling stats table -->
+<div class="card mb-16">
+  <div class="card-head">Rolling Stats <span style="font-weight:400;text-transform:none;letter-spacing:0;margin-left:6px;color:var(--tx-3)">(32-sample ring buffer)</span></div>
+  <div class="card-body p0">
+    <div class="table-wrap" style="border:none;box-shadow:none">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>Metric</th>
+            <th>Current</th>
+            <th>Min</th>
+            <th>Max</th>
+            <th>Avg</th>
+          </tr>
+        </thead>
+        <tbody id="env-stats-body">
+          <tr><td colspan="5" class="muted small" style="text-align:center;padding:20px">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  function buildStatsRow(label, cur, stats, unit) {
+    const p = (v, d=1) => App.fmt(v, d);
+    return `<tr>
+      <td><strong>${label}</strong></td>
+      <td class="mono bold">${p(cur)} ${unit}</td>
+      <td class="mono">${p(stats?.min)} ${unit}</td>
+      <td class="mono">${p(stats?.max)} ${unit}</td>
+      <td class="mono">${p(stats?.avg)} ${unit}</td>
+    </tr>`;
+  }
+
+  function refresh() {
+    const d = App.State.data;
+    const s = d.stats || {};
+    const u = App.State.units;
+    const tu = `°${u}`;
+
+    const tbody = document.getElementById('env-stats-body');
+    if (!tbody) return;
+
+    if (!d.temperature && !d.humidity) {
+      tbody.innerHTML = `<tr><td colspan="5" class="muted small" style="text-align:center;padding:20px">Waiting for sensor data…</td></tr>`;
+      return;
+    }
+
+    tbody.innerHTML = [
+      buildStatsRow('Temperature',    d.temperature,      { min: s.tempMin, max: s.tempMax, avg: s.tempAvg }, tu),
+      buildStatsRow('Humidity',       d.humidity,         { min: s.humMin,  max: s.humMax,  avg: s.humAvg  }, '%'),
+      buildStatsRow('Dew Point',      d.dewPoint,         { min: s.dewMin,  max: s.dewMax,  avg: s.dewAvg  }, tu),
+      buildStatsRow('Heat Index',     d.heatIndex,        null, tu),
+      buildStatsRow('VPD',            d.vpd,              null, 'kPa'),
+      buildStatsRow('Abs. Humidity',  d.absoluteHumidity, null, 'g/m³'),
+    ].join('');
+  }
+
+  window.Env = {
+    refresh,
+  };
+
+  if (typeof Tabs !== 'undefined') Tabs.register('environment', refresh);
+  refresh();
+})();
+</script>
