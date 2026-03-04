@@ -1,0 +1,3 @@
+[submodule "data"]
+	path = data
+	url = https://github.com/Rowson3D/ReptiMon_ui.git
