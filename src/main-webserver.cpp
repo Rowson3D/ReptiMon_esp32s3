@@ -168,6 +168,11 @@ unsigned long lastWebUpdate = 0;
 #ifndef GITHUB_TOKEN
 #define GITHUB_TOKEN ""
 #endif
+// Optional PEM CA certificate for OTA HTTPS validation.
+// Build with -DGITHUB_CA_CERT="R\"EOF(...pem...)EOF\"" to avoid setInsecure().
+#ifndef GITHUB_CA_CERT
+#define GITHUB_CA_CERT ""
+#endif
 static String fwVersion = String(FW_VERSION);
 static String fwCommit  = String(GIT_COMMIT);
 static String fwBuild   = String(BUILD_TIME);
@@ -311,9 +316,17 @@ static int semverCompare(const String& aIn, const String& bIn) {
 }
 
 // OTA helpers (GitHub Releases)
+static void configureOtaClient(WiFiClientSecure& client) {
+  if (strlen(GITHUB_CA_CERT) > 0) {
+    client.setCACert(GITHUB_CA_CERT);
+  } else {
+    client.setInsecure();
+  }
+}
+
 static String httpGet(const String& url) {
   WiFiClientSecure client;
-  client.setInsecure(); // NOTE: For production, pin the certificate
+  configureOtaClient(client);
   HTTPClient https;
   if (!https.begin(client, url)) return String();
   https.addHeader("User-Agent", "ReptiMon-OTA");
@@ -390,7 +403,7 @@ static bool applyOtaFromUrl(const String& url, String& outMsg) {
   otaLogf("Firmware OTA: GET %s", url.c_str());
   setOtaState("fw", 0);
   WiFiClientSecure client;
-  client.setInsecure();
+  configureOtaClient(client);
   HTTPClient https;
   if (!https.begin(client, url)) { outMsg = "begin failed"; return false; }
   // GitHub asset URLs redirect to S3 – follow redirects to get the actual payload
@@ -431,7 +444,7 @@ static bool applyFsOtaFromUrl(const String& url, String& outMsg) {
   otaLogf("FS OTA: GET %s", url.c_str());
   setOtaState("fs", 0);
   WiFiClientSecure client;
-  client.setInsecure();
+  configureOtaClient(client);
   HTTPClient https;
   if (!https.begin(client, url)) { outMsg = "begin failed"; return false; }
   // GitHub asset URLs redirect to S3 – follow redirects to get the actual payload
